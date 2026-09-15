@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": { "@mcpex/contracts": ["../contracts/dist/src/index.d.ts"] }
+  },
+  "references": [{ "path": "../contracts" }],
+  "include": ["src"]
+}

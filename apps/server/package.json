@@ -1,0 +1,26 @@
+{
+  "name": "@mcpex/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^10.0.0",
+    "@mcpex/contracts": "0.1.0",
+    "@mcpex/providers": "0.1.0",
+    "@mcpex/runtime": "0.1.0",
+    "@mcpex/storage": "0.1.0",
+    "@mcpex/tools": "0.1.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "ajv": "^8.20.0",
+    "fastify": "^5.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0"
+  }
+}

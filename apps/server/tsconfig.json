@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": {
+      "@mcpex/contracts": ["../../packages/contracts/dist/src/index.d.ts"],
+      "@mcpex/storage": ["../../packages/storage/dist/src/index.d.ts"],
+      "@mcpex/providers": ["../../packages/providers/dist/src/index.d.ts"],
+      "@mcpex/runtime": ["../../packages/runtime/dist/src/index.d.ts"],
+      "@mcpex/tools": ["../../packages/tools/dist/src/index.d.ts"]
+    }
+  },
+  "references": [
+    { "path": "../../packages/contracts" },
+    { "path": "../../packages/storage" },
+    { "path": "../../packages/providers" },
+    { "path": "../../packages/runtime" },
+    { "path": "../../packages/tools" }
+  ],
+  "include": ["src"]
+}

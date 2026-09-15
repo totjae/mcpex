@@ -1,0 +1,38 @@
+{
+  "name": "mcpex",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @mcpex/contracts && npm run build --workspace @mcpex/storage && npm run build --workspace @mcpex/providers && npm run build --workspace @mcpex/tools && npm run build --workspace @mcpex/runtime && npm run build --workspace @mcpex/server && npm run build --workspace @mcpex/cli && npm run build --workspace @mcpex/web",
+    "dev": "npm run dev --workspace @mcpex/server",
+    "typecheck": "tsc -b && tsc --noEmit -p apps/web/tsconfig.json",
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^24.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0"
+  }
+}
