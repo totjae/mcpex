@@ -58,7 +58,15 @@ describe('MCP connection information', () => {
             payload: {
               displayName: 'Active connection agent',
               toolName: 'active_connection_agent',
-              config: { modelRef: model.id, description: 'Published tool description' },
+              config: {
+                modelRef: model.id,
+                description: 'Published tool description',
+                runtime: {
+                  mode: 'tools',
+                  tools: ['read_file', 'write_file'],
+                  workspacePolicy: { mode: 'none', allowedRoots: [] },
+                },
+              },
             },
           })
         ).body,
@@ -75,13 +83,89 @@ describe('MCP connection information', () => {
         headers,
         payload: { enabled: true },
       });
+      const fullAccess = JSON.parse(
+        (
+          await service.app.inject({
+            method: 'POST',
+            url: '/api/v1/agents',
+            headers,
+            payload: {
+              displayName: 'Full access agent',
+              toolName: 'full_access_agent',
+              config: {
+                modelRef: model.id,
+                runtime: {
+                  mode: 'tools',
+                  tools: ['read_file', 'run_command'],
+                  workspacePolicy: { mode: 'full', allowedRoots: [] },
+                  commands: [{ commandId: 'node', executable: process.execPath, label: 'Node.js' }],
+                },
+              },
+            },
+          })
+        ).body,
+      ) as { id: string; draftRevision: number };
+      await service.app.inject({
+        method: 'POST',
+        url: `/api/v1/agents/${fullAccess.id}/apply`,
+        headers,
+        payload: { expectedRevision: fullAccess.draftRevision },
+      });
+      await service.app.inject({
+        method: 'PUT',
+        url: `/api/v1/agents/${fullAccess.id}/activation`,
+        headers,
+        payload: { enabled: true },
+      });
+      const commandless = JSON.parse(
+        (
+          await service.app.inject({
+            method: 'POST',
+            url: '/api/v1/agents',
+            headers,
+            payload: {
+              displayName: 'Commandless agent',
+              toolName: 'commandless_agent',
+              config: {
+                modelRef: model.id,
+                runtime: {
+                  mode: 'tools',
+                  tools: ['run_command'],
+                  workspacePolicy: { mode: 'fixed', allowedRoots: [dir] },
+                  commands: [],
+                },
+              },
+            },
+          })
+        ).body,
+      ) as { id: string; draftRevision: number };
+      await service.app.inject({
+        method: 'POST',
+        url: `/api/v1/agents/${commandless.id}/apply`,
+        headers,
+        payload: { expectedRevision: commandless.draftRevision },
+      });
+      await service.app.inject({
+        method: 'PUT',
+        url: `/api/v1/agents/${commandless.id}/activation`,
+        headers,
+        payload: { enabled: true },
+      });
       await service.app.inject({
         method: 'PATCH',
         url: `/api/v1/agents/${active.id}`,
         headers,
         payload: {
           expectedRevision: active.draftRevision,
-          draft: { modelRef: model.id, description: 'Unpublished draft description' },
+          draft: {
+            modelRef: model.id,
+            description: 'Unpublished draft description',
+            runtime: {
+              mode: 'tools',
+              tools: ['read_file'],
+              workspacePolicy: { mode: 'fixed', allowedRoots: ['C:\\Unpublished'] },
+            },
+          },
         },
       });
       await service.app.inject({
@@ -116,6 +200,28 @@ describe('MCP connection information', () => {
             name: 'active_connection_agent',
             displayName: 'Active connection agent',
             description: 'Published tool description',
+            runtimeMode: 'tools',
+            workspaceMode: 'none',
+            effectiveTools: [],
+            workspaceState: 'workspace_disabled',
+          },
+          {
+            name: 'commandless_agent',
+            displayName: 'Commandless agent',
+            runtimeMode: 'tools',
+            workspaceMode: 'fixed',
+            effectiveTools: [],
+            workspaceState: 'no_tools',
+          },
+          {
+            name: 'full_access_agent',
+            displayName: 'Full access agent',
+            description:
+              'Full access agent 전체 접근에서는 파일·명령 경로에 절대 경로가 필요합니다. 파일 도구의 결과는 선택한 모델 제공자에게 전달될 수 있으며, 클라우드 모델이면 PC 밖으로 전송됩니다. 허용 명령은 MCPex를 실행 중인 OS 사용자 권한으로 실행되며 OS sandbox가 아닙니다.',
+            runtimeMode: 'tools',
+            workspaceMode: 'full',
+            effectiveTools: ['read_file', 'run_command'],
+            workspaceState: 'full',
           },
         ],
         inactiveAgents: [
@@ -127,6 +233,7 @@ describe('MCP connection information', () => {
         ],
       });
       expect(response.body).not.toContain('Unpublished draft description');
+      expect(response.body).not.toContain('C:\\Unpublished');
       expect(response.body.toLowerCase()).not.toContain('token');
       expect(response.body.toLowerCase()).not.toContain('credential');
     } finally {

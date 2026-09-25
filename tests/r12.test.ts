@@ -57,6 +57,22 @@ describe('R12 bounded tool memory and results', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  it('stops directory iteration at a traversal budget and closes the handle', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mcpex-rta06-'));
+    try {
+      for (let index = 0; index < 40; index++) writeFileSync(join(root, `entry-${index}.txt`), 'x');
+      const tools = new WorkspaceTools(root, { maxTraversalEntries: 10 });
+      const listed = await tools.listFiles('.');
+      expect(listed.items.length).toBeLessThanOrEqual(10);
+      expect(listed.observation.truncated).toBe(true);
+      const cancelled = new AbortController();
+      cancelled.abort();
+      await expect(tools.searchText('.', 'x', cancelled.signal)).rejects.toBeDefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('caps stdout and stderr while the command is still producing output', async () => {
     const root = mkdtempSync(join(tmpdir(), 'mcpex-r12-command-'));
     const tools = new WorkspaceTools(root, { maxResultBytes: 1024 }, [

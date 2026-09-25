@@ -3,6 +3,8 @@ import { Ajv2020, type ErrorObject, type ValidateFunction } from 'ajv/dist/2020.
 const MAX_SCHEMA_BYTES = 64 * 1024;
 const MAX_SCHEMA_DEPTH = 8;
 const MAX_PROPERTIES = 100;
+const MAX_CACHED_SCHEMAS = 64;
+const MAX_CACHED_KEY_BYTES = 512 * 1024;
 export const MAX_INPUT_BYTES = 256 * 1024;
 export const MAX_OUTPUT_BYTES = 128 * 1024;
 
@@ -38,6 +40,13 @@ const supportedTypes = new Set([
   'null',
 ]);
 const ajv = new Ajv2020({ allErrors: true, strict: false, validateSchema: true });
+const validators = new Map<string, { validate: ValidateFunction; bytes: number }>();
+let cachedKeyBytes = 0;
+let compilations = 0;
+
+export function schemaCacheStats(): { entries: number; keyBytes: number; compilations: number } {
+  return { entries: validators.size, keyBytes: cachedKeyBytes, compilations };
+}
 
 export class SchemaContractError extends Error {
   constructor(
@@ -114,14 +123,7 @@ export function validateUserSchema(
       'INVALID_SCHEMA',
       '입력 스키마의 최상위 type은 object여야 합니다.',
     );
-  try {
-    ajv.compile(schema);
-  } catch (error) {
-    throw new SchemaContractError(
-      'INVALID_SCHEMA',
-      error instanceof Error ? error.message : '유효하지 않은 JSON Schema입니다.',
-    );
-  }
+  compile(schema);
   return schema;
 }
 
@@ -132,14 +134,36 @@ function validationMessage(errors: ErrorObject[] | null | undefined): string {
 }
 
 function compile(schema: Record<string, unknown>): ValidateFunction {
+  const key = JSON.stringify(schema);
+  const cached = validators.get(key);
+  if (cached) {
+    validators.delete(key);
+    validators.set(key, cached);
+    return cached.validate;
+  }
+  let validate: ValidateFunction;
   try {
-    return ajv.compile(schema);
+    compilations++;
+    validate = ajv.compile(schema);
   } catch (error) {
     throw new SchemaContractError(
       'INVALID_SCHEMA',
       error instanceof Error ? error.message : '유효하지 않은 JSON Schema입니다.',
     );
+  } finally {
+    ajv.removeSchema(schema);
   }
+  const bytes = Buffer.byteLength(key, 'utf8');
+  if (bytes > MAX_CACHED_KEY_BYTES) return validate;
+  while (validators.size >= MAX_CACHED_SCHEMAS || cachedKeyBytes + bytes > MAX_CACHED_KEY_BYTES) {
+    const oldest = validators.keys().next().value;
+    if (oldest === undefined) break;
+    cachedKeyBytes -= validators.get(oldest)!.bytes;
+    validators.delete(oldest);
+  }
+  validators.set(key, { validate, bytes });
+  cachedKeyBytes += bytes;
+  return validate;
 }
 
 export function validateInput(

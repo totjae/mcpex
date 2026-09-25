@@ -1,8 +1,15 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
-import { BootstrapResponse, SCHEMA_VERSION, newId } from '@mcpex/contracts';
+import {
+  BootstrapResponse,
+  SCHEMA_VERSION,
+  newId,
+  TargetsInput,
+  targetsJsonSchema,
+} from '@mcpex/contracts';
 import {
   DataDirectoryLock,
+  AsyncDpapiSecretStore,
   DpapiSecretStore,
   Storage,
   type AgentRow,
@@ -21,12 +28,22 @@ import {
   type ChatMessage,
   type ToolDefinition,
 } from '@mcpex/providers';
-import { QueueError, RunQueue, runToolLoop } from '@mcpex/runtime';
+import { FULL_ACCESS_WORKSPACE, QueueError, RunQueue, runToolLoop } from '@mcpex/runtime';
 import {
   executeWorkspaceTool,
+  executeTargetTool,
+  getWorkspaceToolDefinitions,
+  resolveWorkspaceRoot,
+  ToolError,
   workspaceToolDefinitions,
+  targetToolDefinitions,
   WorkspaceTools,
+  survivingTree,
+  windowsProcessRows,
+  type BoundTarget,
   type CommandSpec,
+  type ProcessIdentity,
+  type UnsafeCommandTermination,
 } from '@mcpex/tools';
 import {
   createMcpHandler,
@@ -40,6 +57,7 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setImmediate as yieldToLoop } from 'node:timers/promises';
 import {
   SchemaContractError,
   validateInput,
@@ -73,14 +91,18 @@ type AgentConfig = {
   inputSchema?: Record<string, unknown>;
   output?: { format?: 'text' | 'markdown' | 'json'; schema?: Record<string, unknown> };
   generationOverrides?: Record<string, number>;
+  serviceTier?: 'inherit' | ServiceTierSetting;
   runtime?: {
     mode?: 'response' | 'tools';
     tools?: string[];
     maxModelTurns?: number;
     maxToolCalls?: number;
     timeoutMs?: number;
-    workspacePolicy?: { mode?: 'none' | 'fixed' | 'caller'; allowedRoots?: string[] };
+    queueTimeoutMs?: number;
+    executionTimeoutMs?: number;
+    workspacePolicy?: { mode?: 'none' | 'fixed' | 'caller' | 'full'; allowedRoots?: string[] };
     commands?: CommandSpec[];
+    targetBinding?: 'off' | 'optional';
   };
 };
 const templateSections = [
@@ -96,7 +118,8 @@ type ResolvedConfigSnapshot = {
   schemaVersion: 1;
   execution?: {
     workspace: string | null;
-    workspaceSource: 'none' | 'fixed' | 'caller';
+    workspaceSource: 'none' | 'fixed' | 'caller' | 'full';
+    targets?: BoundTarget[];
   };
   agent: AgentConfig;
   model: {
@@ -105,6 +128,7 @@ type ResolvedConfigSnapshot = {
     modelId: string;
     label: string;
     defaultGeneration: GenerationOptions;
+    serviceTier?: ServiceTierSetting | null;
     capabilities: Record<string, unknown>;
     revision: number;
   };
@@ -120,10 +144,83 @@ type ResolvedConfigSnapshot = {
 };
 type RunObservations = {
   toolCalls: number;
-  changes: Array<{ tool: 'write_file' | 'replace_text'; path: string }>;
+  changes: Array<{
+    tool: 'write_file' | 'replace_text' | 'write_target' | 'replace_target';
+    path?: string;
+    targetId?: string;
+  }>;
   checks: Array<{ tool: 'run_command'; commandId: string; exitCode: number | null }>;
+  toolFailures: Array<{ code: string }>;
   truncated: boolean;
 };
+type TaskVerification = {
+  status: 'not_verified' | 'passed' | 'failed';
+  evidence: { checks: RunObservations['checks']; toolFailures: RunObservations['toolFailures'] };
+};
+function taskVerification(observations?: RunObservations): TaskVerification {
+  return {
+    status: 'not_verified',
+    evidence: {
+      checks: observations?.checks ?? [],
+      toolFailures: observations?.toolFailures ?? [],
+    },
+  };
+}
+function isTimeoutCode(code: string): boolean {
+  return ['DEADLINE', 'QUEUE_TIMEOUT', 'EXECUTION_TIMEOUT', 'PROVIDER_TIMEOUT'].includes(code);
+}
+function storedTaskVerification(storage: Storage, runId: string): TaskVerification {
+  const event = storage.getRunFinishedEvent(runId);
+  if (!event) return taskVerification();
+  const payload = JSON.parse(event.payload_json) as { verification?: TaskVerification };
+  return payload.verification ?? taskVerification();
+}
+type TargetChange = { tool: 'write_target' | 'replace_target'; targetId: string };
+function storedTargetChanges(storage: Storage, row: RunRow): TargetChange[] | null | undefined {
+  if (row.content_purged_at || row.events_expired_at) return null;
+  const snapshot = row.config_snapshot_json
+    ? (JSON.parse(row.config_snapshot_json) as ResolvedConfigSnapshot)
+    : undefined;
+  if (!snapshot?.execution?.targets) return undefined;
+  return storage
+    .listRunEvents(row.id)
+    .filter((event) => event.type === 'tool.finished')
+    .flatMap((event): TargetChange[] => {
+      const payload = JSON.parse(event.payload_json) as {
+        ok?: boolean;
+        name?: string;
+        targetId?: string;
+      };
+      return payload.ok === true &&
+        (payload.name === 'write_target' || payload.name === 'replace_target') &&
+        typeof payload.targetId === 'string'
+        ? [{ tool: payload.name, targetId: payload.targetId }]
+        : [];
+    });
+}
+type ServiceTierObservation = { requested: string | null; actual: string | null; source: string };
+function storedServiceTiers(storage: Storage, row: RunRow): ServiceTierObservation[] | null {
+  if (row.events_expired_at) return null;
+  return storage
+    .listRunEvents(row.id)
+    .filter((event) => event.type === 'model.finished')
+    .flatMap((event) => {
+      const payload = JSON.parse(event.payload_json) as {
+        requestedServiceTier?: string | null;
+        actualServiceTier?: string | null;
+        serviceTierSource?: string;
+      };
+      return Object.hasOwn(payload, 'requestedServiceTier')
+        ? [
+            {
+              requested: payload.requestedServiceTier ?? null,
+              actual: payload.actualServiceTier ?? null,
+              source: payload.serviceTierSource ?? 'unknown',
+            },
+          ]
+        : [];
+    });
+}
 type ModelUsage = { promptTokens: number; completionTokens: number; totalTokens: number };
 type ExecutionTelemetry = {
   observations: RunObservations;
@@ -180,6 +277,9 @@ type PreparedImport = {
 };
 const LOCAL_ACCESS_TOKEN_KEY = 'mcpex:local-access-token';
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+export function pruneSessions(sessions: Map<string, number>, now = Date.now()): void {
+  for (const [session, expires] of sessions) if (expires <= now) sessions.delete(session);
+}
 const unsafeMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 export function installGracefulShutdown(close: () => Promise<void>): void {
@@ -204,6 +304,14 @@ export function getLocalAccessToken(dataDir: string): string {
   secrets.set(LOCAL_ACCESS_TOKEN_KEY, created);
   return created;
 }
+export async function getLocalAccessTokenAsync(dataDir: string): Promise<string> {
+  const secrets = new AsyncDpapiSecretStore(dataDir);
+  const existing = await secrets.get(LOCAL_ACCESS_TOKEN_KEY);
+  if (existing) return existing;
+  return await secrets.getOrCreate(LOCAL_ACCESS_TOKEN_KEY, () =>
+    randomBytes(32).toString('base64url'),
+  );
+}
 
 function sameSecret(left: string | undefined, right: string): boolean {
   if (!left) return false;
@@ -227,13 +335,23 @@ function allowedHost(host: string | undefined): boolean {
   }
 }
 
-function runPublic(row: RunRow) {
+function runPublic(
+  row: RunRow,
+  waitReason?: string | null,
+  verification = taskVerification(),
+  targetChanges?: TargetChange[] | null,
+  serviceTiers?: ServiceTierObservation[] | null,
+) {
   return {
     id: row.id,
     agentId: row.agent_id,
     agentVersionId: row.agent_version_id,
     source: row.source,
     status: row.status,
+    verification,
+    ...(targetChanges !== undefined ? { targetChanges } : {}),
+    ...(serviceTiers !== undefined ? { serviceTiers } : {}),
+    waitReason: row.status === 'queued' ? (waitReason ?? null) : null,
     input: JSON.parse(row.input_json),
     output: row.output_json ? JSON.parse(row.output_json) : null,
     error: row.error_json ? JSON.parse(row.error_json) : null,
@@ -241,6 +359,7 @@ function runPublic(row: RunRow) {
     contentPurgedAt: row.content_purged_at ?? null,
     eventsExpiredAt: row.events_expired_at ?? null,
     createdAt: row.created_at,
+    startedAt: row.started_at ?? null,
     finishedAt: row.finished_at,
   };
 }
@@ -365,12 +484,12 @@ function commandSpecs(value: unknown): CommandSpec[] {
   });
 }
 function workspaceRoots(config: AgentConfig): {
-  mode: 'none' | 'fixed' | 'caller';
+  mode: 'none' | 'fixed' | 'caller' | 'full';
   roots: string[];
 } {
   const policy = config.runtime?.workspacePolicy;
   const mode = policy?.mode ?? 'none';
-  if (!['none', 'fixed', 'caller'].includes(mode))
+  if (!['none', 'fixed', 'caller', 'full'].includes(mode))
     throw new WorkspacePolicyError(
       'INVALID_WORKSPACE_POLICY',
       422,
@@ -392,14 +511,14 @@ function workspaceRoots(config: AgentConfig): {
       'allowedRoots의 모든 작업 폴더는 절대 경로여야 합니다.',
     );
   if (
-    (mode === 'none' && roots.length) ||
+    (['none', 'full'].includes(mode) && roots.length) ||
     (mode === 'fixed' && roots.length !== 1) ||
     (mode === 'caller' && roots.length < 1)
   )
     throw new WorkspacePolicyError(
       'INVALID_WORKSPACE_POLICY',
       422,
-      'none은 허용 루트가 없어야 하고, fixed는 하나, caller는 하나 이상의 허용 루트가 필요합니다.',
+      'none과 full은 허용 루트가 없어야 하고, fixed는 하나, caller는 하나 이상의 허용 루트가 필요합니다.',
     );
   return { mode, roots: roots.map((root) => resolve(root)) };
 }
@@ -410,10 +529,75 @@ function isWithinWorkspace(root: string, candidate: string): boolean {
     (!isAbsolute(difference) && difference !== '..' && !difference.startsWith(`..${sep}`))
   );
 }
+function toolFailureDiagnostic(
+  name: string,
+  args: Record<string, unknown>,
+  workspace: string | undefined,
+  error: unknown,
+) {
+  const input = name === 'run_command' ? args.cwd : args.path;
+  const ambiguous =
+    typeof input === 'string' &&
+    process.platform === 'win32' &&
+    (/^[A-Za-z]:(?:$|[^\\/])/.test(input) || /^[\\/](?![\\/])/.test(input));
+  const pathNotation =
+    typeof input !== 'string'
+      ? 'omitted'
+      : ambiguous
+        ? 'ambiguous'
+        : isAbsolute(input)
+          ? 'absolute'
+          : 'relative';
+  const candidate =
+    workspace && typeof input === 'string' && input && !ambiguous && !input.includes('\0')
+      ? resolve(workspace, input)
+      : undefined;
+  const target =
+    candidate && workspace && isWithinWorkspace(workspace, candidate)
+      ? relative(workspace, candidate) || '.'
+      : null;
+  const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+  const reason =
+    (error instanceof ToolError && error.reason) ||
+    (
+      {
+        ENOENT: 'not_found',
+        EXPECTED_HASH_REQUIRED: 'expected_hash_missing',
+        HASH_CONFLICT: 'hash_mismatch',
+        BAD_INPUT: 'invalid_arguments',
+        ACCESS_DENIED: 'access_denied',
+        PATH_FORBIDDEN: 'path_forbidden',
+      } as Record<string, string>
+    )[typeof code === 'string' ? code : ''] ||
+    'other';
+  return {
+    pathNotation,
+    relativeTarget:
+      target && target.length <= 512 && !/[\x00-\x1f\x7f]/.test(target) ? target : null,
+    expectedHashProvided:
+      name === 'write_file' || name === 'replace_text'
+        ? typeof args.expectedHash === 'string' && args.expectedHash.length > 0
+        : null,
+    reason,
+  };
+}
 function resolveRunWorkspace(config: AgentConfig, callerWorkspace?: string) {
   const { mode, roots } = workspaceRoots(config);
   if (mode === 'none') return { workspace: undefined, source: 'none' as const };
-  if (mode === 'fixed') return { workspace: roots[0], source: 'fixed' as const };
+  if (mode === 'full')
+    return { workspace: undefined, lock: FULL_ACCESS_WORKSPACE, source: 'full' as const };
+  const verified = (workspace: string) => {
+    try {
+      return resolveWorkspaceRoot(workspace);
+    } catch {
+      throw new WorkspacePolicyError(
+        'WORKSPACE_NOT_ALLOWED',
+        403,
+        '작업 폴더가 없거나 심볼릭 링크 또는 junction을 포함합니다.',
+      );
+    }
+  };
+  if (mode === 'fixed') return { workspace: verified(roots[0]), source: 'fixed' as const };
   if (!callerWorkspace?.trim())
     throw new WorkspacePolicyError(
       'WORKSPACE_REQUIRED',
@@ -427,19 +611,145 @@ function resolveRunWorkspace(config: AgentConfig, callerWorkspace?: string) {
       '호출 작업 폴더는 절대 경로여야 합니다.',
     );
   const workspace = resolve(callerWorkspace);
-  if (!roots.some((root) => isWithinWorkspace(root, workspace)))
+  const allowedRoots = roots.filter((root) => isWithinWorkspace(root, workspace));
+  if (!allowedRoots.length)
     throw new WorkspacePolicyError(
       'WORKSPACE_NOT_ALLOWED',
       403,
       '호출 작업 폴더가 사전 허용된 루트 밖에 있습니다.',
     );
-  return { workspace, source: 'caller' as const };
+  const actualWorkspace = verified(workspace);
+  if (!allowedRoots.some((root) => isWithinWorkspace(verified(root), actualWorkspace)))
+    throw new WorkspacePolicyError(
+      'WORKSPACE_NOT_ALLOWED',
+      403,
+      '호출 작업 폴더의 실제 경로가 사전 허용된 루트 밖에 있습니다.',
+    );
+  return { workspace: actualWorkspace, source: 'caller' as const };
+}
+function workspaceToolCapability(config: AgentConfig): {
+  runtimeMode: 'response' | 'tools';
+  workspaceMode: 'none' | 'fixed' | 'caller' | 'full';
+  effectiveTools: string[];
+  workspaceState:
+    'response_only' | 'no_tools' | 'workspace_disabled' | 'fixed' | 'caller_required' | 'full';
+} {
+  const runtimeMode = config.runtime?.mode ?? 'response';
+  const workspaceMode = config.runtime?.workspacePolicy?.mode ?? 'none';
+  const configuredTools = getWorkspaceToolDefinitions(false, commandSpecs(config.runtime?.commands))
+    .filter((tool) => config.runtime?.tools?.includes(tool.name))
+    .map((tool) => tool.name);
+  if (runtimeMode !== 'tools')
+    return { runtimeMode, workspaceMode, effectiveTools: [], workspaceState: 'response_only' };
+  if (!configuredTools.length)
+    return { runtimeMode, workspaceMode, effectiveTools: [], workspaceState: 'no_tools' };
+  if (workspaceMode === 'none')
+    return { runtimeMode, workspaceMode, effectiveTools: [], workspaceState: 'workspace_disabled' };
+  return {
+    runtimeMode,
+    workspaceMode,
+    effectiveTools: configuredTools,
+    workspaceState:
+      workspaceMode === 'caller' ? 'caller_required' : workspaceMode === 'full' ? 'full' : 'fixed',
+  };
+}
+function publishedToolDescription(config: AgentConfig, fallback: string): string {
+  const { effectiveTools, workspaceState } = workspaceToolCapability(config);
+  const notes: string[] = [];
+  if (effectiveTools.length && workspaceState === 'fixed')
+    notes.push(
+      '파일·명령 경로는 설정된 작업 폴더와 하위 범위에서 상대 경로 또는 범위 내부 절대 경로를 사용할 수 있습니다.',
+    );
+  if (effectiveTools.length && workspaceState === 'caller_required')
+    notes.push(
+      '파일·명령 경로는 호출에서 선택한 작업 폴더와 하위 범위에서 상대 경로 또는 범위 내부 절대 경로를 사용할 수 있습니다.',
+    );
+  if (effectiveTools.length && workspaceState === 'full')
+    notes.push('전체 접근에서는 파일·명령 경로에 절대 경로가 필요합니다.');
+  if (effectiveTools.some((tool) => tool !== 'run_command'))
+    notes.push(
+      '파일 도구의 결과는 선택한 모델 제공자에게 전달될 수 있으며, 클라우드 모델이면 PC 밖으로 전송됩니다.',
+    );
+  if (effectiveTools.includes('run_command'))
+    notes.push('허용 명령은 MCPex를 실행 중인 OS 사용자 권한으로 실행되며 OS sandbox가 아닙니다.');
+  if (config.runtime?.targetBinding === 'optional')
+    notes.push(
+      '선택적 targets 지정 시 파일은 대상 ID로만 읽고 쓰며 직접 경로 도구와 run_command는 사용할 수 없습니다.',
+    );
+  return [config.description || fallback, ...notes].join(' ');
 }
 type GenerationOptions = {
   temperature?: number;
   topP?: number;
   maxOutputTokens?: number;
 };
+type ServiceTierSetting = 'provider-default' | 'auto' | 'default' | 'flex' | 'priority';
+const serviceTierSettings = new Set<ServiceTierSetting>([
+  'provider-default',
+  'auto',
+  'default',
+  'flex',
+  'priority',
+]);
+function serviceTierSetting(
+  value: unknown,
+  status = 422,
+  allowInherit = false,
+): ServiceTierSetting | 'inherit' | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (allowInherit && value === 'inherit') return 'inherit';
+  if (typeof value === 'string' && serviceTierSettings.has(value as ServiceTierSetting))
+    return value as ServiceTierSetting;
+  throw new ProviderError(status, '지원하지 않는 서비스 티어 설정입니다.');
+}
+function supportsServiceTier(provider: { adapter: string; config: ProviderInput }): boolean {
+  return (
+    provider.adapter === 'openai-chat' &&
+    provider.config.profileId === 'openai' &&
+    provider.config.baseUrl.replace(/\/+$/, '') === 'https://api.openai.com/v1'
+  );
+}
+function requireServiceTierSupport(
+  choice: string | undefined,
+  provider: { adapter: string; config: ProviderInput },
+  status = 422,
+): void {
+  if (choice && choice !== 'provider-default' && !supportsServiceTier(provider))
+    throw new ProviderError(status, '이 프로바이더는 서비스 티어 전용 선택이 확인되지 않았습니다.');
+}
+function effectiveServiceTier(snapshot: ResolvedConfigSnapshot): {
+  request: string | null | undefined;
+  requested: string | null;
+  source: string;
+} {
+  const choice =
+    snapshot.agent.serviceTier && snapshot.agent.serviceTier !== 'inherit'
+      ? snapshot.agent.serviceTier
+      : snapshot.model.serviceTier;
+  const provider = snapshot.provider;
+  requireServiceTierSupport(choice ?? undefined, provider);
+  if (choice === 'provider-default')
+    return {
+      request: supportsServiceTier(provider) ? null : undefined,
+      requested: null,
+      source: 'provider-default',
+    };
+  if (choice)
+    return {
+      request: choice,
+      requested: choice,
+      source:
+        snapshot.agent.serviceTier && snapshot.agent.serviceTier !== 'inherit' ? 'agent' : 'model',
+    };
+  const advanced = supportsServiceTier(provider)
+    ? provider.config.extraBody?.service_tier
+    : undefined;
+  return {
+    request: undefined,
+    requested: typeof advanced === 'string' ? advanced : null,
+    source: advanced === undefined ? 'omitted' : 'advanced',
+  };
+}
 function generationOptions(value: unknown, status = 422): GenerationOptions {
   if (value === undefined) return {};
   if (!value || typeof value !== 'object' || Array.isArray(value))
@@ -481,6 +791,104 @@ function interpolate(template: string, input: Record<string, unknown>): string {
         : JSON.stringify(input[key]),
   );
 }
+class TargetBindingError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly targetId?: string,
+  ) {
+    super(message);
+  }
+}
+function targetInputForModel(config: AgentConfig, input: Record<string, unknown>) {
+  if (config.runtime?.targetBinding !== 'optional' || !('targets' in input)) return input;
+  const parsed = TargetsInput.safeParse(input.targets);
+  if (!parsed.success)
+    throw new TargetBindingError('INVALID_TARGETS', 'targets 형식이 올바르지 않습니다.');
+  return { ...input, targets: parsed.data.map(({ id, access }) => ({ id, access })) };
+}
+function targetSystemMessage(targets: Array<{ id: string; access: string }>) {
+  return `지정된 대상: ${JSON.stringify(targets)}. 대상 ID와 허용 도구만 사용하세요. 대상 경로를 추측하거나 직접 경로로 도구를 호출하지 마세요. task와 대상 지정이 충돌하면 쓰기 전에 확인을 요청하세요.`;
+}
+function validateTargetBindingConfig(config: AgentConfig) {
+  const mode = config.runtime?.targetBinding ?? 'off';
+  if (!['off', 'optional'].includes(mode))
+    throw new ProviderError(422, 'targetBinding은 off 또는 optional이어야 합니다.');
+  if (mode === 'off') return;
+  if (config.runtime?.mode !== 'tools')
+    throw new ProviderError(422, '대상 지정에는 tools 실행 모드가 필요합니다.');
+  const schema = config.inputSchema as
+    { properties?: Record<string, unknown>; required?: string[] } | undefined;
+  if (
+    JSON.stringify(schema?.properties?.targets) !== JSON.stringify(targetsJsonSchema) ||
+    schema?.required?.includes('targets')
+  )
+    throw new SchemaContractError(
+      'INVALID_SCHEMA',
+      'optional 대상 지정에는 공통 targets 선택 스키마가 필요합니다.',
+    );
+}
+async function bindTargets(
+  config: AgentConfig,
+  input: Record<string, unknown>,
+  workspace: string | undefined,
+  source: string,
+  signal?: AbortSignal,
+): Promise<BoundTarget[] | undefined> {
+  signal?.throwIfAborted();
+  if (config.runtime?.targetBinding !== 'optional' || !('targets' in input)) return undefined;
+  const parsed = TargetsInput.safeParse(input.targets);
+  if (!parsed.success)
+    throw new TargetBindingError('INVALID_TARGETS', 'targets 형식이 올바르지 않습니다.');
+  if (source === 'none')
+    throw new TargetBindingError(
+      'TARGET_WORKSPACE_REQUIRED',
+      '대상 지정에는 작업 폴더 정책이 필요합니다.',
+    );
+  const enabled = new Set(config.runtime?.tools ?? []);
+  const tools = new WorkspaceTools(source === 'full' ? null : workspace!);
+  const ids = new Set<string>();
+  const paths = new Set<string>();
+  const bound: BoundTarget[] = [];
+  for (const item of parsed.data) {
+    signal?.throwIfAborted();
+    if (ids.has(item.id))
+      throw new TargetBindingError('DUPLICATE_TARGET_ID', '대상 ID가 중복되었습니다.', item.id);
+    ids.add(item.id);
+    if (
+      (item.access !== 'write' && !enabled.has('read_file')) ||
+      (item.access === 'write' && !enabled.has('write_file')) ||
+      (item.access === 'readwrite' && !enabled.has('write_file') && !enabled.has('replace_text'))
+    )
+      throw new TargetBindingError(
+        'TARGET_TOOL_UNAVAILABLE',
+        '대상 접근에 필요한 파일 도구가 활성화되지 않았습니다.',
+        item.id,
+      );
+    let path: string;
+    try {
+      path = await tools.resolveTarget(item.path, item.access);
+    } catch (error) {
+      signal?.throwIfAborted();
+      const code =
+        error instanceof ToolError
+          ? error.code
+          : ((error as NodeJS.ErrnoException).code ?? 'TARGET_PATH_ERROR');
+      throw new TargetBindingError(code, '대상 파일을 확인할 수 없습니다.', item.id);
+    }
+    signal?.throwIfAborted();
+    const key = process.platform === 'win32' ? path.toLowerCase() : path;
+    if (paths.has(key))
+      throw new TargetBindingError(
+        'DUPLICATE_TARGET_PATH',
+        '동일한 대상 경로가 중복되었습니다.',
+        item.id,
+      );
+    paths.add(key);
+    bound.push({ id: item.id, path, access: item.access });
+  }
+  return bound;
+}
 function agentPublic(row: AgentRow) {
   return {
     id: row.id,
@@ -494,6 +902,15 @@ function agentPublic(row: AgentRow) {
     updatedAt: row.updated_at,
   };
 }
+function scopeMissingFromPrompt(config: AgentConfig): boolean {
+  const properties = (config.inputSchema as { properties?: Record<string, unknown> } | undefined)
+    ?.properties;
+  return Boolean(
+    properties &&
+    Object.hasOwn(properties, 'scope') &&
+    !/{{\s*input\.scope\s*}}/.test(config.userPromptTemplate ?? ''),
+  );
+}
 function modelPublic(row: ModelRow) {
   return {
     id: row.id,
@@ -501,12 +918,14 @@ function modelPublic(row: ModelRow) {
     modelId: row.model_id,
     label: row.label,
     defaultGeneration: JSON.parse(row.defaults_json),
+    serviceTier: row.service_tier ?? null,
     capabilities: JSON.parse(row.capabilities_json),
     revision: row.revision,
   };
 }
 function providerPublic(row: ProviderRow) {
   const config = configFrom(row);
+  const advancedServiceTier = config.extraBody?.service_tier;
   return {
     id: row.id,
     name: row.name,
@@ -521,6 +940,16 @@ function providerPublic(row: ProviderRow) {
     resourceGroupConcurrency: config.resourceGroupConcurrency,
     revision: row.revision,
     hasCredential: Boolean(row.credential_ref),
+    serviceTierSupport: supportsServiceTier({ adapter: row.adapter, config })
+      ? 'supported'
+      : 'unverified',
+    advancedServiceTier:
+      typeof advancedServiceTier === 'string' &&
+      serviceTierSettings.has(advancedServiceTier as ServiceTierSetting)
+        ? advancedServiceTier
+        : advancedServiceTier === undefined
+          ? null
+          : 'custom',
   };
 }
 const defaultConfig = (modelRef: string | null = null): AgentConfig => ({
@@ -537,8 +966,10 @@ const defaultConfig = (modelRef: string | null = null): AgentConfig => ({
   },
   output: { format: 'markdown' },
   generationOverrides: {},
+  serviceTier: 'inherit',
   runtime: {
     mode: 'response',
+    targetBinding: 'off',
     tools: [],
     timeoutMs: 120000,
     maxModelTurns: 1,
@@ -591,11 +1022,14 @@ function builtinTemplateDefinitions(): Array<{ name: string; config: AgentConfig
     type: 'object',
     properties: {
       task: { type: 'string' },
-      workspace: { type: 'string' },
-      scope: { type: 'string' },
+      workspace: {
+        type: 'string',
+        description: '작업 대상 위치(문맥 정보, 파일 도구의 실행 기준 변경 아님)',
+      },
+      scope: { type: 'string', description: '조사하거나 수정할 범위' },
       requirements: { type: 'string' },
     },
-    required: ['task', 'workspace'],
+    required: ['task'],
     additionalProperties: false,
   };
   return [
@@ -635,9 +1069,10 @@ function builtinTemplateDefinitions(): Array<{ name: string; config: AgentConfig
       config: normalizeAgentConfig({
         ...response,
         description: '작업 폴더의 코드를 읽고 검색해 근거와 함께 조사합니다.',
-        systemPrompt: '먼저 관련 파일을 조사하고 코드 근거와 미확인 사항을 구분해 보고하세요.',
+        systemPrompt:
+          '먼저 관련 파일을 조사하고 코드 근거와 미확인 사항을 구분해 보고하세요. 파일 도구의 상대 경로는 설정된 실제 작업 폴더를 기준으로 해석하며, 사용자 입력의 작업 대상 위치는 이 기준을 바꾸지 않습니다.',
         userPromptTemplate:
-          '조사 작업: {{input.task}}\n작업 폴더: {{input.workspace}}\n범위: {{input.scope}}',
+          '조사 작업: {{input.task}}\n작업 대상 위치(문맥 정보): {{input.workspace}}\n범위: {{input.scope}}',
         inputSchema: codeInput,
         runtime: {
           ...response.runtime,
@@ -653,13 +1088,18 @@ function builtinTemplateDefinitions(): Array<{ name: string; config: AgentConfig
       config: normalizeAgentConfig({
         ...response,
         description: '작업 폴더를 조사하고 요청된 코드 변경을 구현합니다.',
-        systemPrompt: '관련 코드를 먼저 조사하고 요청 범위만 수정한 뒤 가능한 검증을 수행하세요.',
+        systemPrompt:
+          '관련 코드를 먼저 조사하고 요청 범위만 수정한 뒤 가능한 검증을 수행하세요. 파일 도구의 상대 경로는 설정된 실제 작업 폴더를 기준으로 해석하며, 사용자 입력의 작업 대상 위치는 이 기준을 바꾸지 않습니다.',
         userPromptTemplate:
-          '구현 작업: {{input.task}}\n작업 폴더: {{input.workspace}}\n요구사항: {{input.requirements}}',
-        inputSchema: codeInput,
+          '구현 작업: {{input.task}}\n작업 대상 위치(문맥 정보): {{input.workspace}}\n범위: {{input.scope}}\n요구사항: {{input.requirements}}',
+        inputSchema: {
+          ...codeInput,
+          properties: { ...codeInput.properties, targets: targetsJsonSchema },
+        },
         runtime: {
           ...response.runtime,
           mode: 'tools',
+          targetBinding: 'optional',
           tools: ['list_files', 'read_file', 'search_text', 'write_file', 'replace_text'],
           maxModelTurns: 20,
           maxToolCalls: 50,
@@ -699,8 +1139,10 @@ function applyTemplateConfig(
     }
     if (section === 'input') next.inputSchema = structuredClone(template.inputSchema ?? {});
     if (section === 'output') next.output = structuredClone(template.output ?? {});
-    if (section === 'generation')
+    if (section === 'generation') {
       next.generationOverrides = structuredClone(template.generationOverrides ?? {});
+      next.serviceTier = template.serviceTier;
+    }
     if (section === 'runtime') next.runtime = structuredClone(template.runtime ?? {});
   }
   next.modelRef = current.modelRef;
@@ -717,7 +1159,8 @@ function templateChanges(current: AgentConfig, next: AgentConfig, sections: Temp
       };
     if (section === 'input') return config.inputSchema;
     if (section === 'output') return config.output;
-    if (section === 'generation') return config.generationOverrides;
+    if (section === 'generation')
+      return { generationOverrides: config.generationOverrides, serviceTier: config.serviceTier };
     return config.runtime;
   };
   return sections.map((section) => {
@@ -729,14 +1172,43 @@ function templateChanges(current: AgentConfig, next: AgentConfig, sections: Temp
 
 function validateTemplateConfig(config: AgentConfig): void {
   validateUserSchema(config.inputSchema, { topLevelObject: true });
+  validateTargetBindingConfig(config);
   commandSpecs(config.runtime?.commands);
   workspaceRoots(config);
   generationOptions(config.generationOverrides);
+  serviceTierSetting(config.serviceTier, 422, true);
+  runtimeTimePolicy(config);
   if (config.output?.format === 'json') {
     if (!config.output.schema)
       throw new SchemaContractError('INVALID_SCHEMA', 'JSON 출력에는 output.schema가 필요합니다.');
     validateUserSchema(config.output.schema);
   }
+}
+
+function runtimeTimePolicy(config: AgentConfig) {
+  serviceTierSetting(config.serviceTier, 422, true);
+  const runtime = config.runtime;
+  const valid = (value: unknown, minimum: number) =>
+    Number.isInteger(value) && (value as number) >= minimum && (value as number) <= 3_600_000;
+  const split = runtime?.queueTimeoutMs !== undefined || runtime?.executionTimeoutMs !== undefined;
+  if (
+    !valid(runtime?.timeoutMs ?? 120000, 1) ||
+    (split && (!valid(runtime?.queueTimeoutMs, 1000) || !valid(runtime?.executionTimeoutMs, 1000)))
+  )
+    throw new ProviderError(
+      422,
+      '전체 제한은 1ms~3600초, 대기·실행 제한은 각각 1~3600초이며 두 값을 함께 설정해야 합니다.',
+    );
+  return split
+    ? {
+        queueTimeoutMs: runtime!.queueTimeoutMs!,
+        executionTimeoutMs: runtime!.executionTimeoutMs!,
+        bridgeTimeoutMs: runtime!.queueTimeoutMs! + runtime!.executionTimeoutMs! + 15000,
+      }
+    : {
+        timeoutMs: runtime?.timeoutMs ?? 120000,
+        bridgeTimeoutMs: (runtime?.timeoutMs ?? 120000) + 15000,
+      };
 }
 
 function templatePublic(row: TemplateRow) {
@@ -762,7 +1234,7 @@ function resolveConfigSnapshot(storage: Storage, configValue: AgentConfig): Reso
   if (!model) throw new ProviderError(422, '모델이 설정되지 않았습니다.');
   const provider = storage.getProvider(model.provider_id);
   if (!provider) throw new ProviderError(422, '프로바이더가 설정되지 않았습니다.');
-  return {
+  const snapshot: ResolvedConfigSnapshot = {
     schemaVersion: 1,
     agent,
     model: {
@@ -771,6 +1243,7 @@ function resolveConfigSnapshot(storage: Storage, configValue: AgentConfig): Reso
       modelId: model.model_id,
       label: model.label,
       defaultGeneration: generationOptions(JSON.parse(model.defaults_json)),
+      serviceTier: serviceTierSetting(model.service_tier) as ServiceTierSetting | undefined,
       capabilities: JSON.parse(model.capabilities_json) as Record<string, unknown>,
       revision: model.revision,
     },
@@ -784,6 +1257,8 @@ function resolveConfigSnapshot(storage: Storage, configValue: AgentConfig): Reso
       hasCredential: Boolean(provider.credential_ref),
     },
   };
+  effectiveServiceTier(snapshot);
+  return snapshot;
 }
 
 function appliedConfigSnapshot(storage: Storage, value: unknown): ResolvedConfigSnapshot {
@@ -838,6 +1313,7 @@ function configEnvelope(storage: Storage): ConfigEnvelope {
       modelId: row.model_id,
       label: row.label,
       defaultGeneration: JSON.parse(row.defaults_json),
+      serviceTier: row.service_tier ?? undefined,
       capabilities: JSON.parse(row.capabilities_json),
     })),
     agents: storage.listAgents().map((row) => ({
@@ -973,12 +1449,23 @@ function prepareConfigImport(storage: Storage, value: unknown): PreparedImport {
     modelKeys.add(key);
     const capabilities = raw.capabilities ?? {};
     if (!isRecord(capabilities)) throw new ProviderError(400, 'capabilities는 객체여야 합니다.');
+    const importedTier = serviceTierSetting(raw.serviceTier, 400) as ServiceTierSetting | undefined;
+    const importedProvider = rows.providers.find((row) => row.id === providerId)!;
+    requireServiceTierSupport(
+      importedTier,
+      {
+        adapter: importedProvider.adapter,
+        config: JSON.parse(importedProvider.config_json) as ProviderInput,
+      },
+      400,
+    );
     rows.models.push({
       id: mapped,
       provider_id: providerId,
       model_id: modelId,
       label,
       defaults_json: json(generationOptions(raw.defaultGeneration, 400)),
+      service_tier: importedTier ?? null,
       capabilities_json: json(capabilities),
       revision: 1,
       created_at: timestamp,
@@ -986,9 +1473,11 @@ function prepareConfigImport(storage: Storage, value: unknown): PreparedImport {
     });
   }
   const toolNames = new Set(
-    (storage.db.prepare('SELECT tool_name FROM agents').all() as Array<{ tool_name: string }>).map(
-      (row) => row.tool_name.toLocaleLowerCase(),
-    ),
+    (
+      storage.db.prepare('SELECT tool_name FROM agents WHERE deleted_at IS NULL').all() as Array<{
+        tool_name: string;
+      }>
+    ).map((row) => row.tool_name.toLocaleLowerCase()),
   );
   for (const raw of envelope.agents) {
     if (!isRecord(raw)) throw new ProviderError(400, 'agent 항목은 객체여야 합니다.');
@@ -1070,30 +1559,118 @@ export async function createServer(
   const lock = new DataDirectoryLock(dataDir);
   lock.acquire();
   let storage: Storage;
-  let secrets: DpapiSecretStore;
+  let secrets: AsyncDpapiSecretStore;
   let app: FastifyInstance;
   let localAccessToken: string | undefined;
   let localAccessTokenRevision: string | undefined;
+  type UnsafeBlock = UnsafeCommandTermination & {
+    id: string;
+    workspace: string;
+    createdAt: string;
+  };
+  let unsafeBlocks: UnsafeBlock[] = [];
   try {
     storage = new Storage(dataDir);
     storage.interruptUnfinishedRuns();
-    secrets = new DpapiSecretStore(dataDir);
+    const savedBlocks = storage.getSetting('unsafeCommandBlocks');
+    if (savedBlocks) {
+      const parsed: unknown = JSON.parse(savedBlocks);
+      if (
+        !Array.isArray(parsed) ||
+        !parsed.every(
+          (item) =>
+            isRecord(item) &&
+            typeof item.id === 'string' &&
+            typeof item.workspace === 'string' &&
+            (item.workspace === FULL_ACCESS_WORKSPACE || isAbsolute(item.workspace)) &&
+            typeof item.createdAt === 'string' &&
+            typeof item.reason === 'string' &&
+            Array.isArray(item.processes) &&
+            item.processes.every(
+              (process) =>
+                isRecord(process) &&
+                Number.isSafeInteger(process.pid) &&
+                typeof process.started === 'string' &&
+                /^\d+$/.test(process.started),
+            ),
+        )
+      )
+        throw new Error(
+          '저장된 명령 종료 차단 상태를 확인할 수 없습니다. 서비스 시작을 중지합니다.',
+        );
+      unsafeBlocks = parsed as UnsafeBlock[];
+    }
+    secrets = new AsyncDpapiSecretStore(dataDir);
     app = Fastify({ logger: false });
     await app.register(cookie);
-    localAccessToken = getLocalAccessToken(dataDir);
-    localAccessTokenRevision = secrets.revision(LOCAL_ACCESS_TOKEN_KEY);
+    localAccessToken = await getLocalAccessTokenAsync(dataDir);
+    localAccessTokenRevision = await secrets.revision(LOCAL_ACCESS_TOKEN_KEY);
   } catch (error) {
     lock.release();
     throw error;
   }
-  const retentionDays = settingInteger(storage, 'retentionDays', 30, 1, 365);
-  storage.purgeExpiredRunContent(
-    new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString(),
+  let purgeInFlight: Promise<{ runs: number; events: number }> | undefined;
+  const purge = async (cutoff: string): Promise<{ runs: number; events: number }> => {
+    while (purgeInFlight) await purgeInFlight;
+    const task = (async () => {
+      const total = { runs: 0, events: 0 };
+      for (;;) {
+        const batch = storage.purgeExpiredRunContentBatch(cutoff);
+        total.runs += batch.runs;
+        total.events += batch.events;
+        if (batch.runs < 100) return total;
+        await yieldToLoop();
+      }
+    })();
+    purgeInFlight = task;
+    try {
+      return await task;
+    } finally {
+      if (purgeInFlight === task) purgeInFlight = undefined;
+    }
+  };
+  const retentionCutoff = (days: number) =>
+    new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  await purge(retentionCutoff(settingInteger(storage, 'retentionDays', 30, 1, 365)));
+  const purgeTimer = setInterval(
+    () => {
+      void purge(retentionCutoff(settingInteger(storage, 'retentionDays', 30, 1, 365))).catch(() =>
+        console.error('MCPex retention cleanup failed.'),
+      );
+    },
+    60 * 60 * 1000,
   );
+  purgeTimer.unref?.();
   const queue = new RunQueue(
     settingInteger(storage, 'globalConcurrency', 2, 1, 8),
     settingInteger(storage, 'maxPendingRuns', 100, 1, 1000),
   );
+  for (const block of unsafeBlocks) queue.blockWorkspace(block.workspace);
+  const recordUnsafeTermination = (workspace: string, failure: UnsafeCommandTermination) => {
+    queue.blockWorkspace(workspace);
+    unsafeBlocks.push({ id: newId(), workspace, createdAt: now(), ...failure });
+    storage.setSettings({ unsafeCommandBlocks: json(unsafeBlocks) });
+  };
+  const releaseUnsafeBlock = (block: UnsafeBlock) => {
+    const remaining = unsafeBlocks.filter((item) => item.id !== block.id);
+    storage.setSettings({ unsafeCommandBlocks: json(remaining) });
+    unsafeBlocks = remaining;
+    if (!remaining.some((item) => item.workspace === block.workspace))
+      queue.unblockWorkspace(block.workspace);
+  };
+  const inspectUnsafeBlock = async (block: UnsafeBlock) => {
+    const survivors = survivingTree(await windowsProcessRows(), block.processes);
+    block.processes.push(
+      ...survivors.filter(
+        (item) =>
+          !block.processes.some(
+            (known) => known.pid === item.pid && known.started === item.started,
+          ),
+      ),
+    );
+    storage.setSettings({ unsafeCommandBlocks: json(unsafeBlocks) });
+    return survivors;
+  };
   for (const provider of storage.listProviders()) {
     const config = configFrom(provider);
     queue.setProviderLimit(provider.id, boundedInteger(config.maxConcurrency, 2, 1, 8));
@@ -1103,11 +1680,11 @@ export async function createServer(
   const activePromises = new Set<Promise<unknown>>();
   const sessions = new Map<string, number>();
   let bootstrap: { token: string; expires: number } | undefined;
-  const hasLocalAccessToken = (request: FastifyRequest) => {
+  const hasLocalAccessToken = async (request: FastifyRequest) => {
     try {
-      const currentRevision = secrets.revision(LOCAL_ACCESS_TOKEN_KEY);
+      const currentRevision = await secrets.revision(LOCAL_ACCESS_TOKEN_KEY);
       if (currentRevision !== localAccessTokenRevision) {
-        localAccessToken = currentRevision ? secrets.get(LOCAL_ACCESS_TOKEN_KEY) : undefined;
+        localAccessToken = currentRevision ? await secrets.get(LOCAL_ACCESS_TOKEN_KEY) : undefined;
         localAccessTokenRevision = currentRevision;
       }
     } catch {
@@ -1123,14 +1700,14 @@ export async function createServer(
     const path = request.url.split('?', 1)[0];
     if (path === '/health' || path === '/auth/exchange') return;
     if (path === '/auth/bootstrap' || path === '/mcp') {
-      if (!hasLocalAccessToken(request))
+      if (!(await hasLocalAccessToken(request)))
         return reply
           .code(401)
           .send({ error: { code: 'UNAUTHORIZED', message: '로컬 접속 인증이 필요합니다.' } });
       return;
     }
     if (!path.startsWith('/api/')) return;
-    const hasLocalToken = hasLocalAccessToken(request);
+    const hasLocalToken = await hasLocalAccessToken(request);
     const session = request.cookies.mcpex_session;
     const expires = session ? sessions.get(session) : undefined;
     if (!hasLocalToken && (!expires || expires <= Date.now())) {
@@ -1146,6 +1723,79 @@ export async function createServer(
           error: { code: 'CSRF_REJECTED', message: 'Origin 또는 CSRF 검증에 실패했습니다.' },
         });
     }
+  });
+  app.get('/api/v1/safety-blocks', async () => ({ items: unsafeBlocks }));
+  app.post('/api/v1/safety-blocks/:id/verify', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const block = unsafeBlocks.find((item) => item.id === id);
+    if (!block)
+      return reply
+        .code(404)
+        .send({ error: { code: 'NOT_FOUND', message: '차단 기록이 없습니다.' } });
+    if (!block.processes.length)
+      return reply.code(409).send({
+        error: {
+          code: 'PROCESS_INSPECTION_INCOMPLETE',
+          message: '프로세스 식별 기록이 없어 자동 해제할 수 없습니다. 수동 확인이 필요합니다.',
+        },
+      });
+    try {
+      if ((await inspectUnsafeBlock(block)).length)
+        return reply.code(409).send({
+          error: {
+            code: 'COMMAND_PROCESS_STILL_RUNNING',
+            message: '기록된 명령 프로세스가 아직 실행 중입니다. 차단을 유지합니다.',
+          },
+        });
+    } catch {
+      return reply.code(503).send({
+        error: {
+          code: 'PROCESS_INSPECTION_FAILED',
+          message: '프로세스 종료를 확인하지 못했습니다. 차단을 유지합니다.',
+        },
+      });
+    }
+    // Snapshots cannot prove that an unobserved intermediate left no descendants.
+    return reply.code(409).send({
+      error: {
+        code: 'PROCESS_INSPECTION_INCOMPLETE',
+        message:
+          '현재 확인된 프로세스는 없지만 추적 공백으로 전체 종료를 증명할 수 없습니다. 차단을 유지하며 수동 확인이 필요합니다.',
+      },
+    });
+  });
+  app.post('/api/v1/safety-blocks/:id/manual-release', async (req, reply) => {
+    const block = unsafeBlocks.find((item) => item.id === (req.params as { id: string }).id);
+    if (!block)
+      return reply
+        .code(404)
+        .send({ error: { code: 'NOT_FOUND', message: '차단 기록이 없습니다.' } });
+    const body = bodyOf(req);
+    if (body.workspace !== block.workspace || body.confirm !== 'I_VERIFIED_PROCESS_TREE_EXITED')
+      return reply.code(400).send({
+        error: {
+          code: 'MANUAL_VERIFICATION_REQUIRED',
+          message: '작업 폴더와 전체 프로세스 트리 종료 확인을 명시해야 합니다.',
+        },
+      });
+    try {
+      if (block.processes.length && (await inspectUnsafeBlock(block)).length)
+        return reply.code(409).send({
+          error: {
+            code: 'COMMAND_PROCESS_STILL_RUNNING',
+            message: '기록된 명령 프로세스가 아직 실행 중입니다. 차단을 유지합니다.',
+          },
+        });
+    } catch {
+      return reply.code(503).send({
+        error: {
+          code: 'PROCESS_INSPECTION_FAILED',
+          message: '프로세스 조회 또는 추적 기록 저장에 실패했습니다. 차단을 유지합니다.',
+        },
+      });
+    }
+    releaseUnsafeBlock(block);
+    return reply.send({ released: true, verification: 'operator_attested' });
   });
   app.get('/health', async () => ({
     status: 'ok',
@@ -1175,6 +1825,9 @@ export async function createServer(
         .code(401)
         .send({ error: { code: 'UNAUTHORIZED', message: '유효하지 않거나 만료된 토큰입니다.' } });
     bootstrap = undefined;
+    pruneSessions(sessions);
+    const previousSession = req.cookies.mcpex_session;
+    if (previousSession) sessions.delete(previousSession);
     const session = randomBytes(32).toString('base64url');
     sessions.set(session, Date.now() + SESSION_TTL_MS);
     reply.setCookie('mcpex_session', session, {
@@ -1250,7 +1903,16 @@ export async function createServer(
     maxPendingRuns: settingInteger(storage, 'maxPendingRuns', 100, 1, 1000),
   }));
   app.get('/api/v1/mcp-connection', async () => {
-    const tools: Array<{ name: string; displayName: string; description: string }> = [];
+    const tools: Array<{
+      name: string;
+      displayName: string;
+      description: string;
+      runtimeMode: 'response' | 'tools';
+      workspaceMode: 'none' | 'fixed' | 'caller' | 'full';
+      effectiveTools: string[];
+      workspaceState:
+        'response_only' | 'no_tools' | 'workspace_disabled' | 'fixed' | 'caller_required' | 'full';
+    }> = [];
     const inactiveAgents: Array<{
       name: string;
       displayName: string;
@@ -1281,7 +1943,8 @@ export async function createServer(
       tools.push({
         name: row.tool_name,
         displayName: row.display_name,
-        description: config.description || row.display_name,
+        description: publishedToolDescription(config, row.display_name),
+        ...workspaceToolCapability(config),
       });
     }
     tools.sort((left, right) => left.name.localeCompare(right.name));
@@ -1328,9 +1991,7 @@ export async function createServer(
     });
     queue.setConcurrency(next.globalConcurrency as number);
     queue.setMaxPending(next.maxPendingRuns as number);
-    const purged = storage.purgeExpiredRunContent(
-      new Date(Date.now() - (next.retentionDays as number) * 24 * 60 * 60 * 1000).toISOString(),
-    );
+    const purged = await purge(retentionCutoff(next.retentionDays as number));
     return reply.send({ ...next, purged });
   });
   app.post('/api/v1/backups', async (_req, reply) => {
@@ -1547,7 +2208,9 @@ export async function createServer(
         maxConcurrency,
         resourceGroup: typeof resourceGroup === 'string' ? resourceGroup.trim() : undefined,
         resourceGroupConcurrency,
-        extraBody: b.extraBody ?? current.extraBody ?? {},
+        extraBody: b.extraBody
+          ? { ...current.extraBody, ...b.extraBody }
+          : (current.extraBody ?? {}),
       }),
       revision: row.revision + 1,
       updated_at: now(),
@@ -1571,7 +2234,7 @@ export async function createServer(
       return reply.code(409).send({
         error: { code: 'CONFLICT', message: '등록 모델이 있는 프로바이더는 삭제할 수 없습니다.' },
       });
-    if (row.credential_ref) secrets.delete(row.credential_ref);
+    if (row.credential_ref) await secrets.delete(row.credential_ref);
     storage.deleteProvider(id);
     syncResourceGroupLimits(storage, queue);
     return reply.code(204).send();
@@ -1588,7 +2251,7 @@ export async function createServer(
       const ids = await getAdapter(row.adapter).listModels(
         c.baseUrl,
         c.headers ?? {},
-        row.credential_ref ? secrets.get(row.credential_ref) : undefined,
+        row.credential_ref ? await secrets.get(row.credential_ref) : undefined,
         operation.signal,
       );
       return reply.send({ modelIds: ids });
@@ -1602,9 +2265,12 @@ export async function createServer(
         });
       if (operation.disconnectSignal.aborted) return reply;
       const x = e as ProviderError;
-      return reply
-        .code(x.status ?? 502)
-        .send({ error: { code: 'PROVIDER_ERROR', message: x.message } });
+      return reply.code(x.status ?? 502).send({
+        error: {
+          code: x instanceof ProviderError ? x.code : 'PROVIDER_ERROR',
+          message: x.message,
+        },
+      });
     } finally {
       operation.dispose();
     }
@@ -1617,11 +2283,15 @@ export async function createServer(
       return reply
         .code(404)
         .send({ error: { code: 'NOT_FOUND', message: '프로바이더를 찾을 수 없습니다.' } });
+    if (b.expectedRevision !== undefined && b.expectedRevision !== row.revision)
+      return reply
+        .code(409)
+        .send({ error: { code: 'CONFLICT', message: '프로바이더 revision이 일치하지 않습니다.' } });
     if (typeof b.apiKey !== 'string' || !b.apiKey)
       return reply
         .code(400)
         .send({ error: { code: 'BAD_REQUEST', message: 'apiKey가 필요합니다.' } });
-    secrets.set(`provider:${id}`, b.apiKey);
+    await secrets.set(`provider:${id}`, b.apiKey);
     const next = {
       ...row,
       credential_ref: `provider:${id}`,
@@ -1634,11 +2304,16 @@ export async function createServer(
   app.delete('/api/v1/providers/:id/credential', async (req, reply) => {
     const id = (req.params as { id: string }).id;
     const row = storage.getProvider(id);
+    const b = bodyOf(req);
     if (!row)
       return reply
         .code(404)
         .send({ error: { code: 'NOT_FOUND', message: '프로바이더를 찾을 수 없습니다.' } });
-    if (row.credential_ref) secrets.delete(row.credential_ref);
+    if (b.expectedRevision !== undefined && b.expectedRevision !== row.revision)
+      return reply
+        .code(409)
+        .send({ error: { code: 'CONFLICT', message: '프로바이더 revision이 일치하지 않습니다.' } });
+    if (row.credential_ref) await secrets.delete(row.credential_ref);
     const next = {
       ...row,
       credential_ref: null,
@@ -1670,8 +2345,18 @@ export async function createServer(
         .code(400)
         .send({ error: { code: 'BAD_REQUEST', message: 'providerId와 modelId가 필요합니다.' } });
     let defaultGeneration: GenerationOptions;
+    let serviceTier: ServiceTierSetting | undefined;
     try {
       defaultGeneration = generationOptions(b.defaultGeneration, 400);
+      serviceTier = serviceTierSetting(
+        b.serviceTier ?? 'provider-default',
+        400,
+      ) as ServiceTierSetting;
+      requireServiceTierSupport(
+        serviceTier,
+        { adapter: provider.adapter, config: configFrom(provider) },
+        400,
+      );
     } catch (error) {
       const providerError = error as ProviderError;
       return reply.code(providerError.status).send({
@@ -1685,6 +2370,7 @@ export async function createServer(
       model_id: b.modelId,
       label: typeof b.label === 'string' ? b.label : b.modelId,
       defaults_json: json(defaultGeneration),
+      service_tier: serviceTier,
       capabilities_json: json(b.capabilities ?? { text: { supported: true, source: 'user' } }),
       revision: 1,
       created_at: t,
@@ -1716,11 +2402,25 @@ export async function createServer(
         error: { code: 'BAD_REQUEST', message: 'modelId와 label은 비어 있을 수 없습니다.' },
       });
     let defaultGeneration: GenerationOptions;
+    let serviceTier: ServiceTierSetting | undefined;
+    const modelProvider = storage.getProvider(row.provider_id)!;
     try {
       defaultGeneration =
         b.defaultGeneration === undefined
           ? generationOptions(JSON.parse(row.defaults_json), 400)
           : generationOptions(b.defaultGeneration, 400);
+      serviceTier = serviceTierSetting(
+        b.serviceTier === undefined ? row.service_tier : b.serviceTier,
+        400,
+      ) as ServiceTierSetting | undefined;
+      requireServiceTierSupport(
+        serviceTier,
+        {
+          adapter: modelProvider.adapter,
+          config: configFrom(modelProvider),
+        },
+        400,
+      );
     } catch (error) {
       const providerError = error as ProviderError;
       return reply.code(providerError.status).send({
@@ -1739,6 +2439,7 @@ export async function createServer(
       model_id: modelId,
       label,
       defaults_json: json(defaultGeneration),
+      service_tier: serviceTier ?? null,
       capabilities_json: json(b.capabilities ?? JSON.parse(row.capabilities_json)),
       revision: row.revision + 1,
       updated_at: now(),
@@ -1778,6 +2479,23 @@ export async function createServer(
     const prompt = typeof b.prompt === 'string' ? b.prompt : '간단히 응답해 주세요.';
     const operation = providerOperationSignal(req, reply, c.requestTimeoutMs ?? 120000);
     try {
+      const choice = serviceTierSetting(model.service_tier) as ServiceTierSetting | undefined;
+      requireServiceTierSupport(choice, { adapter: provider.adapter, config: c });
+      const requestTier =
+        choice === 'provider-default' &&
+        supportsServiceTier({ adapter: provider.adapter, config: c })
+          ? null
+          : choice === 'provider-default'
+            ? undefined
+            : choice;
+      const requestedTier =
+        requestTier === undefined
+          ? supportsServiceTier({ adapter: provider.adapter, config: c }) &&
+            typeof c.extraBody?.service_tier === 'string'
+            ? c.extraBody.service_tier
+            : null
+          : requestTier;
+      const generation = generationOptions(JSON.parse(model.defaults_json));
       const r = await getAdapter(provider.adapter).generate(
         {
           modelId: model.model_id,
@@ -1787,14 +2505,21 @@ export async function createServer(
               : []),
             { role: 'user', content: prompt },
           ],
+          ...generation,
+          serviceTier: requestTier,
           signal: operation.signal,
         },
         c.baseUrl,
         c.headers ?? {},
-        provider.credential_ref ? secrets.get(provider.credential_ref) : undefined,
+        provider.credential_ref ? await secrets.get(provider.credential_ref) : undefined,
         c.extraBody,
       );
-      return reply.send({ result: r, credentialExposed: false });
+      return reply.send({
+        result: r,
+        requestedServiceTier: requestedTier,
+        actualServiceTier: r.serviceTier ?? null,
+        credentialExposed: false,
+      });
     } catch (e) {
       if (operation.timeoutSignal.aborted)
         return reply.code(504).send({
@@ -1805,32 +2530,55 @@ export async function createServer(
         });
       if (operation.disconnectSignal.aborted) return reply;
       const x = e as ProviderError;
-      return reply
-        .code(x.status ?? 502)
-        .send({ error: { code: 'PROVIDER_ERROR', message: x.message } });
+      return reply.code(x.status ?? 502).send({
+        error: {
+          code: x instanceof ProviderError ? x.code : 'PROVIDER_ERROR',
+          message: x.message,
+        },
+      });
     } finally {
       operation.dispose();
     }
   });
-  const existingBuiltins = new Set(
+  const existingBuiltins = new Map(
     storage
       .listTemplates()
       .filter((template) => template.origin === 'builtin')
-      .map((template) => template.name),
+      .map((template) => [template.name, template]),
   );
   for (const definition of builtinTemplateDefinitions()) {
-    if (existingBuiltins.has(definition.name)) continue;
+    const existing = existingBuiltins.get(definition.name);
+    const configJson = json(definition.config);
+    if (existing) {
+      if (existing.config_json !== configJson)
+        storage.updateBuiltinTemplate(existing.id, configJson, now());
+      continue;
+    }
     storage.createTemplate({
       id: newId(),
       origin: 'builtin',
       name: definition.name,
       version: 1,
-      config_json: json(definition.config),
+      config_json: configJson,
       updated_at: now(),
     });
   }
   app.get('/api/v1/agents', async () => ({
-    items: storage.listAgents().map(agentPublic),
+    items: storage.listAgents().map((row) => {
+      const version = row.applied_version_id
+        ? storage.getAgentVersion(row.applied_version_id)
+        : undefined;
+      const stored = version ? JSON.parse(version.config_json) : undefined;
+      const appliedConfig = stored
+        ? isResolvedSnapshot(stored)
+          ? stored.agent
+          : (stored as AgentConfig)
+        : undefined;
+      return {
+        ...agentPublic(row),
+        appliedScopeMissing: appliedConfig ? scopeMissingFromPrompt(appliedConfig) : false,
+      };
+    }),
     nextCursor: null,
   }));
   app.post('/api/v1/agents', async (req, reply) => {
@@ -1859,8 +2607,13 @@ export async function createServer(
       updated_at: t,
     };
     try {
+      runtimeTimePolicy(JSON.parse(row.draft_json));
       storage.createAgent(row);
-    } catch {
+    } catch (error) {
+      if (error instanceof ProviderError)
+        return reply
+          .code(error.status)
+          .send({ error: { code: 'INVALID_CONFIG', message: error.message } });
       return reply
         .code(409)
         .send({ error: { code: 'CONFLICT', message: '동일한 toolName이 이미 있습니다.' } });
@@ -1945,11 +2698,16 @@ export async function createServer(
       updated_at: now(),
     };
     try {
+      runtimeTimePolicy(JSON.parse(next.draft_json));
       if (!storage.updateAgentDraft(next, row.draft_revision))
         return reply
           .code(409)
           .send({ error: { code: 'CONFLICT', message: '초안 저장 충돌입니다.' } });
-    } catch {
+    } catch (error) {
+      if (error instanceof ProviderError)
+        return reply
+          .code(error.status)
+          .send({ error: { code: 'INVALID_CONFIG', message: error.message } });
       return reply
         .code(409)
         .send({ error: { code: 'CONFLICT', message: '동일한 toolName이 이미 있습니다.' } });
@@ -2029,7 +2787,9 @@ export async function createServer(
     let snapshot: ResolvedConfigSnapshot;
     try {
       snapshot = resolveConfigSnapshot(storage, config);
+      runtimeTimePolicy(config);
       validateUserSchema(config.inputSchema, { topLevelObject: true });
+      validateTargetBindingConfig(config);
       commandSpecs(config.runtime?.commands);
       workspaceRoots(config);
       if (config.output?.format === 'json') {
@@ -2277,23 +3037,47 @@ export async function createServer(
     const input = (b.input ?? {}) as Record<string, unknown>;
     const model = c.modelRef ? storage.getModel(c.modelRef) : undefined;
     let resolvedGeneration: GenerationOptions;
+    let previewTier: { requested: string | null; source: string } | null = null;
     try {
       resolvedGeneration = {
         ...generationOptions(model ? JSON.parse(model.defaults_json) : undefined),
         ...generationOptions(c.generationOverrides),
       };
+      if (model) {
+        const tier = effectiveServiceTier(resolveConfigSnapshot(storage, c));
+        previewTier = { requested: tier.requested, source: tier.source };
+      }
     } catch (error) {
       const providerError = error as ProviderError;
       return reply.code(providerError.status).send({
         error: { code: 'INVALID_CONFIG', message: providerError.message },
       });
     }
+    let modelInput: Record<string, unknown>;
+    try {
+      modelInput = targetInputForModel(c, input);
+    } catch (error) {
+      if (error instanceof TargetBindingError)
+        return reply.code(400).send({ error: { code: error.code, message: error.message } });
+      throw error;
+    }
     return reply.send({
       messages: [
         ...(c.systemPrompt ? [{ role: 'system', content: c.systemPrompt }] : []),
-        { role: 'user', content: interpolate(c.userPromptTemplate ?? '', input) },
+        ...(c.runtime?.targetBinding === 'optional' && Array.isArray(modelInput.targets)
+          ? [
+              {
+                role: 'system',
+                content: targetSystemMessage(
+                  modelInput.targets as Array<{ id: string; access: string }>,
+                ),
+              },
+            ]
+          : []),
+        { role: 'user', content: interpolate(c.userPromptTemplate ?? '', modelInput) },
       ],
       generationOptions: resolvedGeneration,
+      serviceTier: previewTier,
     });
   });
   async function executeAgent(
@@ -2308,6 +3092,7 @@ export async function createServer(
       toolCalls: 0,
       changes: [],
       checks: [],
+      toolFailures: [],
       truncated: false,
     };
     let modelUsage: ModelUsage | null = null;
@@ -2318,18 +3103,55 @@ export async function createServer(
       ...snapshot.model.defaultGeneration,
       ...generationOptions(config.generationOverrides),
     };
+    const tier = effectiveServiceTier(snapshot);
     try {
+      const modelInput = targetInputForModel(config, input);
       const initialMessages: ChatMessage[] = [
         ...(config.systemPrompt ? [{ role: 'system' as const, content: config.systemPrompt }] : []),
-        { role: 'user' as const, content: interpolate(config.userPromptTemplate ?? '', input) },
+        ...(snapshot.execution?.targets
+          ? [
+              {
+                role: 'system' as const,
+                content: targetSystemMessage(
+                  snapshot.execution.targets.map(({ id, access }) => ({ id, access })),
+                ),
+              },
+            ]
+          : []),
+        {
+          role: 'user' as const,
+          content: interpolate(config.userPromptTemplate ?? '', modelInput),
+        },
       ];
       const workspace = snapshot.execution?.workspace ?? undefined;
-      const enabledTools =
-        workspace && config.runtime?.mode === 'tools'
-          ? workspaceToolDefinitions.filter((tool) => config.runtime?.tools?.includes(tool.name))
+      const fullAccess = snapshot.execution?.workspaceSource === 'full';
+      const ordinaryTools =
+        (workspace || fullAccess) && config.runtime?.mode === 'tools'
+          ? getWorkspaceToolDefinitions(fullAccess, commands).filter((tool) =>
+              config.runtime?.tools?.includes(tool.name),
+            )
           : [];
+      const targets = snapshot.execution?.targets;
+      const targetTools = targets
+        ? targetToolDefinitions.filter((tool) =>
+            tool.name === 'read_target'
+              ? config.runtime?.tools?.includes('read_file') &&
+                targets.some((target) => target.access !== 'write')
+              : tool.name === 'write_target'
+                ? config.runtime?.tools?.includes('write_file') &&
+                  targets.some((target) => target.access !== 'read')
+                : config.runtime?.tools?.includes('replace_text') &&
+                  targets.some((target) => target.access === 'readwrite'),
+          )
+        : [];
+      const enabledTools = targets ? targetTools : ordinaryTools;
       const enabledToolNames = new Set(enabledTools.map((tool) => tool.name));
-      const workspaceTools = workspace ? new WorkspaceTools(workspace, {}, commands) : undefined;
+      const workspaceTools =
+        workspace || fullAccess
+          ? new WorkspaceTools(fullAccess ? null : workspace!, {}, commands, (failure) =>
+              recordUnsafeTermination(fullAccess ? FULL_ACCESS_WORKSPACE : workspace!, failure),
+            )
+          : undefined;
       const generate = async (
         messages: ChatMessage[],
         tools: ToolDefinition[],
@@ -2350,6 +3172,7 @@ export async function createServer(
               temperature: resolvedGeneration.temperature,
               topP: resolvedGeneration.topP,
               maxOutputTokens: resolvedGeneration.maxOutputTokens,
+              serviceTier: tier.request,
               signal: requestSignal,
             },
             c.baseUrl,
@@ -2371,13 +3194,20 @@ export async function createServer(
               finishReason: generated.finishReason,
               usage: generated.usage,
               providerRequestId: generated.providerRequestId,
+              requestedServiceTier: tier.requested,
+              actualServiceTier: generated.serviceTier ?? null,
+              serviceTierSource: tier.source,
             }),
           );
           return generated;
         } catch (error) {
-          storage.appendRunEvent(run.id, 'model.finished', json({ ok: false }));
+          storage.appendRunEvent(
+            run.id,
+            'model.finished',
+            json({ ok: false, requestedServiceTier: tier.requested }),
+          );
           if (requestTimeoutSignal.aborted && !parentSignal?.aborted)
-            throw new QueueError('DEADLINE', '공급업체 요청 시간이 초과되었습니다.');
+            throw new QueueError('PROVIDER_TIMEOUT', '공급업체 요청 시간이 초과되었습니다.');
           throw error;
         }
       };
@@ -2395,16 +3225,31 @@ export async function createServer(
             storage.appendRunEvent(
               run.id,
               'tool.started',
-              json({ callId: call.id, name: call.name }),
+              json({
+                callId: call.id,
+                name: call.name,
+                ...(targets && typeof call.arguments.targetId === 'string'
+                  ? { targetId: call.arguments.targetId }
+                  : {}),
+              }),
             );
             try {
-              const toolResult = await executeWorkspaceTool(
-                workspaceTools,
-                enabledToolNames,
-                call.name,
-                call.arguments,
-                signal,
-              );
+              const toolResult = targets
+                ? await executeTargetTool(
+                    workspaceTools,
+                    targets,
+                    enabledToolNames,
+                    call.name,
+                    call.arguments,
+                    signal,
+                  )
+                : await executeWorkspaceTool(
+                    workspaceTools,
+                    enabledToolNames,
+                    call.name,
+                    call.arguments,
+                    signal,
+                  );
               const resultRecord = isRecord(toolResult) ? toolResult : undefined;
               const observation =
                 resultRecord && isRecord(resultRecord.observation)
@@ -2412,10 +3257,19 @@ export async function createServer(
                   : undefined;
               if (observation?.truncated === true) observations.truncated = true;
               if (
-                (call.name === 'write_file' || call.name === 'replace_text') &&
-                typeof resultRecord?.path === 'string'
+                ['write_file', 'replace_text', 'write_target', 'replace_target'].includes(
+                  call.name,
+                ) &&
+                (typeof resultRecord?.path === 'string' ||
+                  typeof resultRecord?.targetId === 'string')
               )
-                observations.changes.push({ tool: call.name, path: resultRecord.path });
+                observations.changes.push({
+                  tool: call.name as RunObservations['changes'][number]['tool'],
+                  ...(typeof resultRecord?.path === 'string' ? { path: resultRecord.path } : {}),
+                  ...(typeof resultRecord?.targetId === 'string'
+                    ? { targetId: resultRecord.targetId }
+                    : {}),
+                });
               if (
                 call.name === 'run_command' &&
                 typeof resultRecord?.commandId === 'string' &&
@@ -2433,16 +3287,46 @@ export async function createServer(
                   callId: call.id,
                   name: call.name,
                   ok: true,
+                  ...(targets && typeof call.arguments.targetId === 'string'
+                    ? { targetId: call.arguments.targetId }
+                    : {}),
                   observation: observation ?? null,
                 }),
               );
               return json(toolResult);
             } catch (error) {
+              const code =
+                error &&
+                typeof error === 'object' &&
+                'code' in error &&
+                typeof error.code === 'string' &&
+                /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code)
+                  ? error.code
+                  : 'TOOL_ERROR';
+              observations.toolFailures.push({ code });
               storage.appendRunEvent(
                 run.id,
                 'tool.finished',
-                json({ callId: call.id, name: call.name, ok: false }),
+                json({
+                  callId: call.id,
+                  name: call.name,
+                  ok: false,
+                  ...(targets && typeof call.arguments.targetId === 'string'
+                    ? { targetId: call.arguments.targetId }
+                    : {}),
+                  error: { code },
+                  diagnostic: targets
+                    ? {
+                        targetId:
+                          typeof call.arguments.targetId === 'string'
+                            ? call.arguments.targetId
+                            : null,
+                      }
+                    : toolFailureDiagnostic(call.name, call.arguments, workspace, error),
+                }),
               );
+              if (targets && !(error instanceof ToolError))
+                throw new ToolError('TARGET_FILE_ERROR', '대상 파일 작업에 실패했습니다.');
               throw error;
             }
           },
@@ -2457,13 +3341,15 @@ export async function createServer(
       }
       const text = result.text;
       const output = validateOutput(config.output, text);
-      storage.finishRun(run.id, 'completed', json(output), null);
+      const verification = taskVerification(observations);
+      storage.finishRun(run.id, 'completed', json(output), null, { verification });
       return {
         run,
         result: {
           text,
           output,
           observations,
+          verification,
           validation: {
             format: config.output?.format === 'json' ? 'passed' : 'not_required',
             model: 'not_configured',
@@ -2485,7 +3371,14 @@ export async function createServer(
           'failed',
           e.output ? json(e.output) : null,
           json({ code: e.code, message: e.message, details: e.details }),
+          { verification: taskVerification(observations) },
         );
+        throw e;
+      }
+      if (e instanceof ToolError && e.code === 'COMMAND_TERMINATION_FAILED') {
+        storage.finishRun(run.id, 'failed', null, json({ code: e.code, message: e.message }), {
+          verification: taskVerification(observations),
+        });
         throw e;
       }
       if (e instanceof QueueError || signal.aborted) throw e;
@@ -2494,12 +3387,13 @@ export async function createServer(
         run.id,
         'failed',
         null,
-        json({ code: 'PROVIDER_ERROR', message: x.message }),
+        json({ code: x instanceof ProviderError ? x.code : 'PROVIDER_ERROR', message: x.message }),
+        { verification: taskVerification(observations) },
       );
       throw x;
     }
   }
-  function submitAgent(
+  async function submitAgent(
     row: AgentRow,
     versionId: string | null,
     source: string,
@@ -2508,23 +3402,40 @@ export async function createServer(
     callerSignal?: AbortSignal,
     callerWorkspace?: string,
   ) {
-    if (!queue.canAccept) throw new QueueError('QUEUE_FULL', '실행 대기열이 가득 찼습니다.');
+    if (callerSignal?.aborted) throw new QueueError('CANCELLED', '실행이 취소되었습니다.');
     const config = snapshot.agent;
     validateInput(config.inputSchema, input);
     commandSpecs(config.runtime?.commands);
     generationOptions(config.generationOverrides);
     generationOptions(snapshot.model.defaultGeneration);
+    effectiveServiceTier(snapshot);
+    const timePolicy = runtimeTimePolicy(config);
     const resolvedWorkspace = resolveRunWorkspace(config, callerWorkspace);
+    const safetyWorkspace =
+      'lock' in resolvedWorkspace ? resolvedWorkspace.lock : resolvedWorkspace.workspace;
+    if (safetyWorkspace && queue.isWorkspaceBlocked(safetyWorkspace))
+      throw new QueueError('WORKSPACE_BLOCKED', '명령 종료 확인 실패·추가 실행 차단 상태입니다.');
+    if (!queue.canAccept) throw new QueueError('QUEUE_FULL', '실행 대기열이 가득 찼습니다.');
+    const targets = await bindTargets(
+      config,
+      input,
+      resolvedWorkspace.workspace,
+      resolvedWorkspace.source,
+      callerSignal,
+    );
+    if (callerSignal?.aborted) throw new QueueError('CANCELLED', '실행이 취소되었습니다.');
     const runSnapshot: ResolvedConfigSnapshot = {
       ...snapshot,
       execution: {
         workspace: resolvedWorkspace.workspace ?? null,
         workspaceSource: resolvedWorkspace.source,
+        ...(targets ? { targets } : {}),
       },
     };
     const providerConfig = snapshot.provider.config;
     const credentialRef = storage.getProvider(snapshot.provider.id)?.credential_ref;
-    const credential = credentialRef ? secrets.get(credentialRef) : undefined;
+    const credential = credentialRef ? await secrets.get(credentialRef) : undefined;
+    if (callerSignal?.aborted) throw new QueueError('CANCELLED', '실행이 취소되었습니다.');
     queue.setProviderLimit(
       snapshot.provider.id,
       boundedInteger(
@@ -2551,9 +3462,9 @@ export async function createServer(
     const controller = new AbortController();
     const cancelFromCaller = () => controller.abort();
     callerSignal?.addEventListener('abort', cancelFromCaller, { once: true });
+    if (callerSignal?.aborted) cancelFromCaller();
     activeRuns.set(run.id, controller);
-    const workspace = resolvedWorkspace.workspace;
-    const timeoutMs = Math.min(Math.max(config.runtime?.timeoutMs ?? 120000, 1), 3_600_000);
+    const workspace = safetyWorkspace;
     const promise = queue
       .submit(
         async (signal) => {
@@ -2565,18 +3476,26 @@ export async function createServer(
         controller.signal,
         {
           provider: snapshot.model.providerId,
+          runId: run.id,
           resourceGroup: providerConfig.resourceGroup,
-          deadlineAt: Date.now() + timeoutMs,
+          deadlineAt: Date.now() + (timePolicy.queueTimeoutMs ?? timePolicy.timeoutMs ?? 120000),
+          executionTimeoutMs: timePolicy.executionTimeoutMs,
         },
       )
       .catch((error: unknown) => {
         if (error instanceof QueueError) {
-          const status = error.code === 'CANCELLED' ? 'cancelled' : 'timed_out';
+          const status =
+            error.code === 'CANCELLED'
+              ? 'cancelled'
+              : isTimeoutCode(error.code)
+                ? 'timed_out'
+                : 'failed';
           storage.finishRun(
             run.id,
             status,
             null,
             json({ code: error.code, message: error.message }),
+            { verification: taskVerification(executionTelemetryFrom(error)?.observations) },
           );
         }
         throw error;
@@ -2603,7 +3522,7 @@ export async function createServer(
     try {
       const config = normalizeAgentConfig(JSON.parse(row.draft_json));
       const snapshot = resolveConfigSnapshot(storage, config);
-      const submitted = submitAgent(
+      const submitted = await submitAgent(
         row,
         null,
         'ui',
@@ -2623,11 +3542,23 @@ export async function createServer(
         return reply.code(response.status).send(response.body);
       }
       if (e instanceof QueueError)
-        return reply.code(e.code === 'QUEUE_FULL' ? 429 : e.code === 'CANCELLED' ? 409 : 504).send({
-          error: { code: e.code, message: e.message },
-        });
+        return reply
+          .code(
+            e.code === 'QUEUE_FULL'
+              ? 429
+              : ['CANCELLED', 'WORKSPACE_BLOCKED'].includes(e.code)
+                ? 409
+                : 504,
+          )
+          .send({
+            error: { code: e.code, message: e.message },
+          });
       if (e instanceof WorkspacePolicyError)
         return reply.code(e.status).send({ error: { code: e.code, message: e.message } });
+      if (e instanceof TargetBindingError)
+        return reply
+          .code(422)
+          .send({ error: { code: e.code, message: e.message, targetId: e.targetId } });
       const x = e as ProviderError;
       return reply
         .code(x.status ?? 502)
@@ -2640,7 +3571,15 @@ export async function createServer(
       return reply
         .code(404)
         .send({ error: { code: 'NOT_FOUND', message: '실행 기록을 찾을 수 없습니다.' } });
-    return reply.send(runPublic(r));
+    return reply.send(
+      runPublic(
+        r,
+        queue.waitReason(r.id),
+        storedTaskVerification(storage, r.id),
+        storedTargetChanges(storage, r),
+        storedServiceTiers(storage, r),
+      ),
+    );
   });
   app.get('/api/v1/runs/:id/events', async (req, reply) => {
     const id = (req.params as { id: string }).id;
@@ -2676,33 +3615,57 @@ export async function createServer(
     let closed = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const stop = () => {
+      if (closed) return;
       closed = true;
       if (timer) clearTimeout(timer);
+      reply.raw.off('drain', pump);
+      reply.raw.off('close', stop);
+      reply.raw.off('error', fail);
     };
-    req.raw.once('close', stop);
-    const pump = () => {
-      if (closed) return;
-      const events = storage.listRunEvents(id, cursor);
-      for (const event of events) {
-        cursor = event.seq;
-        const payload = JSON.parse(event.payload_json) as unknown;
-        const data =
-          payload && typeof payload === 'object' && !Array.isArray(payload)
-            ? { ...payload, createdAt: event.created_at }
-            : { value: payload, createdAt: event.created_at };
-        reply.raw.write(
-          `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(data)}\n\n`,
-        );
-      }
-      const run = storage.getRun(id);
-      if (run && !['queued', 'running'].includes(run.status)) {
-        stop();
-        reply.raw.end();
-        return;
-      }
-      timer = setTimeout(pump, 50);
+    const fail = () => {
+      stop();
+      reply.raw.destroy();
+    };
+    const schedule = (delay: number) => {
+      timer = setTimeout(pump, delay);
       timer.unref?.();
     };
+    const pump = () => {
+      if (closed) return;
+      try {
+        const events = storage.listRunEvents(id, cursor, 100);
+        for (const event of events) {
+          const payload = JSON.parse(event.payload_json) as unknown;
+          const data =
+            payload && typeof payload === 'object' && !Array.isArray(payload)
+              ? { ...payload, createdAt: event.created_at }
+              : { value: payload, createdAt: event.created_at };
+          const writable = reply.raw.write(
+            `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(data)}\n\n`,
+          );
+          cursor = event.seq;
+          if (!writable) {
+            reply.raw.once('drain', pump);
+            return;
+          }
+        }
+        if (events.length === 100) {
+          schedule(0);
+          return;
+        }
+        const current = storage.getRun(id);
+        if (current && !['queued', 'running'].includes(current.status)) {
+          stop();
+          reply.raw.end();
+          return;
+        }
+        schedule(50);
+      } catch {
+        fail();
+      }
+    };
+    reply.raw.once('close', stop);
+    reply.raw.once('error', fail);
     pump();
   });
   app.post('/api/v1/runs/:id/cancel', async (req, reply) => {
@@ -2712,7 +3675,16 @@ export async function createServer(
       return reply
         .code(404)
         .send({ error: { code: 'NOT_FOUND', message: '실행 기록을 찾을 수 없습니다.' } });
-    if (!['queued', 'running'].includes(run.status)) return reply.send(runPublic(run));
+    if (!['queued', 'running'].includes(run.status))
+      return reply.send(
+        runPublic(
+          run,
+          undefined,
+          storedTaskVerification(storage, run.id),
+          storedTargetChanges(storage, run),
+          storedServiceTiers(storage, run),
+        ),
+      );
     storage.appendRunEvent(id, 'run.cancel_requested', json({ status: run.status }));
     activeRuns.get(id)?.abort();
     return reply.code(202).send({ id, status: 'cancel_requested' });
@@ -2720,7 +3692,15 @@ export async function createServer(
   app.get('/api/v1/runs', async (req) => ({
     items: storage
       .listRuns((req.query as { agentId?: string }).agentId)
-      .map((row) => runPublic(row)),
+      .map((row) =>
+        runPublic(
+          row,
+          queue.waitReason(row.id),
+          storedTaskVerification(storage, row.id),
+          storedTargetChanges(storage, row),
+          storedServiceTiers(storage, row),
+        ),
+      ),
     nextCursor: null,
   }));
   const mcpHandler = createMcpHandler(() => {
@@ -2738,16 +3718,15 @@ export async function createServer(
       server.registerTool(
         row.tool_name,
         {
-          description: config.description || row.display_name,
+          description: publishedToolDescription(config, row.display_name),
+          _meta: { 'io.mcpex/bridgeTimeoutMs': runtimeTimePolicy(config).bridgeTimeoutMs },
           inputSchema: fromJsonSchema<Record<string, unknown>>(
             config.inputSchema as JsonSchemaType,
           ),
           annotations: {
-            readOnlyHint:
-              config.runtime?.mode !== 'tools' ||
-              !config.runtime.tools?.some((name) =>
-                ['write_file', 'replace_text', 'run_command'].includes(name),
-              ),
+            readOnlyHint: !workspaceToolCapability(config).effectiveTools.some((name) =>
+              ['write_file', 'replace_text', 'run_command'].includes(name),
+            ),
             openWorldHint: false,
           },
         },
@@ -2755,7 +3734,7 @@ export async function createServer(
           const callStartedAt = Date.now();
           let runId: string | null = null;
           try {
-            const submitted = submitAgent(
+            const submitted = await submitAgent(
               row,
               version.id,
               'mcp',
@@ -2775,6 +3754,7 @@ export async function createServer(
               outcome: 'succeeded',
               output: result.result.output,
               observations: result.result.observations,
+              verification: result.result.verification,
               validation: result.result.validation,
               usage: result.result.usage,
               error: null,
@@ -2790,12 +3770,20 @@ export async function createServer(
               ],
             };
           } catch (e) {
-            const x = e as ProviderError | SchemaContractError | QueueError | WorkspacePolicyError;
+            const x = e as
+              | ProviderError
+              | SchemaContractError
+              | QueueError
+              | ToolError
+              | WorkspacePolicyError
+              | TargetBindingError;
             const telemetry = executionTelemetryFrom(e);
             const code =
               x instanceof SchemaContractError ||
               x instanceof QueueError ||
-              x instanceof WorkspacePolicyError
+              x instanceof ToolError ||
+              x instanceof WorkspacePolicyError ||
+              x instanceof TargetBindingError
                 ? x.code
                 : 'PROVIDER_ERROR';
             const envelope = {
@@ -2804,7 +3792,7 @@ export async function createServer(
               status:
                 x instanceof QueueError && x.code === 'CANCELLED'
                   ? 'cancelled'
-                  : x instanceof QueueError && x.code === 'DEADLINE'
+                  : x instanceof QueueError && isTimeoutCode(x.code)
                     ? 'timed_out'
                     : 'failed',
               outcome: 'failed',
@@ -2813,11 +3801,17 @@ export async function createServer(
                 toolCalls: 0,
                 changes: [],
                 checks: [],
+                toolFailures: [],
                 truncated: false,
               },
+              verification: taskVerification(telemetry?.observations),
               validation: { format: 'not_completed', model: 'not_configured' },
               usage: telemetry?.usage ?? null,
-              error: { code, message: x.message },
+              error: {
+                code,
+                message: x.message,
+                ...(x instanceof TargetBindingError && x.targetId ? { targetId: x.targetId } : {}),
+              },
               durationMs: telemetry?.durationMs ?? Math.max(0, Date.now() - callStartedAt),
             };
             return {
@@ -2868,9 +3862,11 @@ export async function createServer(
     close: async () => {
       if (closed) return;
       closed = true;
+      clearInterval(purgeTimer);
       for (const controller of activeRuns.values()) controller.abort();
       await app.close();
       await Promise.allSettled([...activePromises]);
+      if (purgeInFlight) await purgeInFlight.catch(() => undefined);
       await mcpHandler.close();
       storage.close();
       lock.release();

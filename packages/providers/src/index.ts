@@ -17,6 +17,7 @@ export type GenerateRequest = {
   temperature?: number;
   topP?: number;
   maxOutputTokens?: number;
+  serviceTier?: string | null;
   signal?: AbortSignal;
 };
 export type GenerateResult = {
@@ -25,6 +26,7 @@ export type GenerateResult = {
   finishReason: string | null;
   usage: { promptTokens: number; completionTokens: number; totalTokens: number } | null;
   providerRequestId: string | null;
+  serviceTier?: string | null;
 };
 export type ProviderProfile = {
   id: string;
@@ -183,9 +185,37 @@ export class ProviderError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly code = 'PROVIDER_ERROR',
   ) {
     super(message);
     this.name = 'ProviderError';
+  }
+}
+const MAX_PROVIDER_RESPONSE_BYTES = 2 * 1024 * 1024;
+export async function boundedResponseText(response: Response): Promise<string> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      total += part.value.byteLength;
+      if (total > MAX_PROVIDER_RESPONSE_BYTES)
+        throw new ProviderError(
+          502,
+          '공급업체 응답 크기 제한을 초과했습니다.',
+          'PROVIDER_RESPONSE_TOO_LARGE',
+        );
+      chunks.push(part.value);
+    }
+    return Buffer.concat(chunks, total).toString('utf8');
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
+    reader.releaseLock();
   }
 }
 export interface ModelAdapter {
@@ -224,8 +254,13 @@ export class OpenAIChatAdapter implements ModelAdapter {
     credential: string | undefined,
     extraBody: Record<string, unknown> = {},
   ): Promise<GenerateResult> {
+    const requestExtraBody = { ...extraBody };
+    if (request.serviceTier !== undefined) {
+      delete requestExtraBody.service_tier;
+      if (request.serviceTier !== null) requestExtraBody.service_tier = request.serviceTier;
+    }
     const body = {
-      ...extraBody,
+      ...requestExtraBody,
       model: request.modelId,
       messages: request.messages.map((message) => ({
         role: message.role,
@@ -267,7 +302,7 @@ export class OpenAIChatAdapter implements ModelAdapter {
       body: JSON.stringify(body),
       signal: request.signal,
     });
-    const raw = await response.text();
+    const raw = await boundedResponseText(response);
     if (!response.ok) throw new ProviderError(response.status, safeMessage(response.status, raw));
     let parsed: {
       id?: string;
@@ -279,6 +314,7 @@ export class OpenAIChatAdapter implements ModelAdapter {
         finish_reason?: string;
       }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+      service_tier?: unknown;
     };
     try {
       parsed = JSON.parse(raw) as typeof parsed;
@@ -318,6 +354,7 @@ export class OpenAIChatAdapter implements ModelAdapter {
       finishReason: choice.finish_reason ?? null,
       usage,
       providerRequestId: parsed.id ?? null,
+      serviceTier: typeof parsed.service_tier === 'string' ? parsed.service_tier : null,
     };
   }
   async listModels(
@@ -330,7 +367,7 @@ export class OpenAIChatAdapter implements ModelAdapter {
       headers: { ...headers, ...(credential ? { authorization: `Bearer ${credential}` } : {}) },
       signal,
     });
-    const raw = await response.text();
+    const raw = await boundedResponseText(response);
     if (!response.ok) throw new ProviderError(response.status, safeMessage(response.status, raw));
     try {
       const parsed = JSON.parse(raw) as { data?: Array<{ id?: string }> };
@@ -422,7 +459,7 @@ export class AnthropicMessagesAdapter implements ModelAdapter {
       body: JSON.stringify(body),
       signal: request.signal,
     });
-    const raw = await response.text();
+    const raw = await boundedResponseText(response);
     if (!response.ok) throw new ProviderError(response.status, safeMessage(response.status, raw));
     let parsed: {
       id?: string;
@@ -478,7 +515,7 @@ export class AnthropicMessagesAdapter implements ModelAdapter {
       },
       signal,
     });
-    const raw = await response.text();
+    const raw = await boundedResponseText(response);
     if (!response.ok) throw new ProviderError(response.status, safeMessage(response.status, raw));
     try {
       const parsed = JSON.parse(raw) as { data?: Array<{ id?: string }> };
@@ -569,7 +606,7 @@ export class GeminiGenerateContentAdapter implements ModelAdapter {
         signal: request.signal,
       },
     );
-    const raw = await response.text();
+    const raw = await boundedResponseText(response);
     if (!response.ok) throw new ProviderError(response.status, safeMessage(response.status, raw));
     let parsed: {
       responseId?: string;
@@ -635,7 +672,7 @@ export class GeminiGenerateContentAdapter implements ModelAdapter {
       headers: { ...headers, ...(credential ? { 'x-goog-api-key': credential } : {}) },
       signal,
     });
-    const raw = await response.text();
+    const raw = await boundedResponseText(response);
     if (!response.ok) throw new ProviderError(response.status, safeMessage(response.status, raw));
     try {
       const parsed = JSON.parse(raw) as { models?: Array<{ name?: string }> };
@@ -763,7 +800,7 @@ export class BedrockConverseAdapter implements ModelAdapter {
         signal: request.signal,
       },
     );
-    const raw = await response.text();
+    const raw = await boundedResponseText(response);
     if (!response.ok) throw new ProviderError(response.status, safeMessage(response.status, raw));
     let parsed: {
       output?: {

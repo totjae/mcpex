@@ -8,10 +8,12 @@ import {
   readFileSync,
   statSync,
   writeFileSync,
+  promises as fsp,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { SCHEMA_VERSION } from '@mcpex/contracts';
 
 type LockOwner = {
@@ -237,6 +239,66 @@ export class Storage {
         throw error;
       }
     }
+    if (version < 5) {
+      this.db.exec('BEGIN');
+      try {
+        this.db.exec('ALTER TABLE runs ADD COLUMN started_at TEXT');
+        this.db.exec(
+          "UPDATE runs SET started_at=(SELECT created_at FROM run_events WHERE run_id=runs.id AND type='run.started' LIMIT 1)",
+        );
+        this.db.prepare("UPDATE settings SET value='5' WHERE key='schemaVersion'").run();
+        this.db
+          .prepare('INSERT INTO schema_migrations VALUES (?, ?)')
+          .run(5, new Date().toISOString());
+        this.db.exec('COMMIT');
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
+      }
+    }
+    if (version < 6) {
+      // SQLite cannot remove a column-level UNIQUE constraint without rebuilding the table.
+      // Keep the parent table name and IDs so historical versions and runs retain their FKs.
+      this.db.exec('PRAGMA foreign_keys = OFF');
+      try {
+        this.db.exec('BEGIN');
+        try {
+          this.db.exec(
+            `CREATE TABLE agents_new (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, tool_name TEXT NOT NULL, enabled INTEGER NOT NULL, draft_json TEXT NOT NULL, draft_revision INTEGER NOT NULL, applied_version_id TEXT, deleted_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             INSERT INTO agents_new SELECT id, display_name, tool_name, enabled, draft_json, draft_revision, applied_version_id, deleted_at, created_at, updated_at FROM agents;
+             DROP TABLE agents;
+             ALTER TABLE agents_new RENAME TO agents;
+             CREATE UNIQUE INDEX agents_live_tool_name ON agents(tool_name) WHERE deleted_at IS NULL;`,
+          );
+          const foreignKeyErrors = this.db.prepare('PRAGMA foreign_key_check').all();
+          if (foreignKeyErrors.length) throw new Error('MIGRATION_FOREIGN_KEY_CHECK_FAILED');
+          this.db.prepare("UPDATE settings SET value='6' WHERE key='schemaVersion'").run();
+          this.db
+            .prepare('INSERT INTO schema_migrations VALUES (?, ?)')
+            .run(6, new Date().toISOString());
+          this.db.exec('COMMIT');
+        } catch (error) {
+          this.db.exec('ROLLBACK');
+          throw error;
+        }
+      } finally {
+        this.db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+    if (version < 7) {
+      this.db.exec('BEGIN');
+      try {
+        this.db.exec('ALTER TABLE models ADD COLUMN service_tier TEXT');
+        this.db.prepare("UPDATE settings SET value='7' WHERE key='schemaVersion'").run();
+        this.db
+          .prepare('INSERT INTO schema_migrations VALUES (?, ?)')
+          .run(7, new Date().toISOString());
+        this.db.exec('COMMIT');
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
+      }
+    }
   }
   private createMigrationBackup(fromVersion: number): void {
     const directory = join(this.dataDir, 'backups');
@@ -305,7 +367,9 @@ export class Storage {
   }
   createModel(row: ModelRow): void {
     this.db
-      .prepare('INSERT INTO models VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .prepare(
+        'INSERT INTO models (id, provider_id, model_id, label, defaults_json, capabilities_json, revision, created_at, updated_at, service_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
       .run(
         row.id,
         row.provider_id,
@@ -316,12 +380,13 @@ export class Storage {
         row.revision,
         row.created_at,
         row.updated_at,
+        row.service_tier ?? null,
       );
   }
   updateModel(row: ModelRow, expectedRevision: number): boolean {
     const result = this.db
       .prepare(
-        'UPDATE models SET model_id=?, label=?, defaults_json=?, capabilities_json=?, revision=?, updated_at=? WHERE id=? AND revision=?',
+        'UPDATE models SET model_id=?, label=?, defaults_json=?, capabilities_json=?, revision=?, updated_at=?, service_tier=? WHERE id=? AND revision=?',
       )
       .run(
         row.model_id,
@@ -330,6 +395,7 @@ export class Storage {
         row.capabilities_json,
         row.revision,
         row.updated_at,
+        row.service_tier ?? null,
         row.id,
         expectedRevision,
       ) as { changes?: number };
@@ -466,6 +532,13 @@ export class Storage {
       .prepare('INSERT INTO templates VALUES (?, ?, ?, ?, ?, ?)')
       .run(row.id, row.origin, row.name, row.version, row.config_json, row.updated_at);
   }
+  updateBuiltinTemplate(id: string, configJson: string, updatedAt: string): void {
+    this.db
+      .prepare(
+        "UPDATE templates SET version=version+1, config_json=?, updated_at=? WHERE id=? AND origin='builtin'",
+      )
+      .run(configJson, updatedAt, id);
+  }
   updateTemplate(row: TemplateRow, expectedVersion: number): boolean {
     const result = this.db
       .prepare(
@@ -578,8 +651,8 @@ export class Storage {
     this.db.exec('BEGIN');
     try {
       const result = this.db
-        .prepare("UPDATE runs SET status='running' WHERE id=? AND status='queued'")
-        .run(id) as { changes?: number };
+        .prepare("UPDATE runs SET status='running', started_at=? WHERE id=? AND status='queued'")
+        .run(nowText(), id) as { changes?: number };
       const changed = (result.changes ?? 0) === 1;
       if (changed) this.insertRunEvent(id, 'run.started', JSON.stringify({ status: 'running' }));
       this.db.exec('COMMIT');
@@ -589,13 +662,19 @@ export class Storage {
       throw error;
     }
   }
-  finishRun(id: string, status: string, outputJson: string | null, errorJson: string | null): void {
+  finishRun(
+    id: string,
+    status: string,
+    outputJson: string | null,
+    errorJson: string | null,
+    eventDetails: Record<string, unknown> = {},
+  ): void {
     this.db.exec('BEGIN');
     try {
       this.db
         .prepare('UPDATE runs SET status=?, output_json=?, error_json=?, finished_at=? WHERE id=?')
         .run(status, outputJson, errorJson, nowText(), id);
-      this.insertRunEvent(id, 'run.finished', JSON.stringify({ status }));
+      this.insertRunEvent(id, 'run.finished', JSON.stringify({ status, ...eventDetails }));
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -641,17 +720,28 @@ export class Storage {
         : this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC LIMIT ?').all(limit)
     ) as RunRow[];
   }
-  listRunEvents(runId: string, afterSeq = 0): RunEventRow[] {
-    return this.db
-      .prepare('SELECT * FROM run_events WHERE run_id=? AND seq>? ORDER BY seq')
-      .all(runId, afterSeq) as RunEventRow[];
+  listRunEvents(runId: string, afterSeq = 0, limit?: number): RunEventRow[] {
+    return limit === undefined
+      ? (this.db
+          .prepare('SELECT * FROM run_events WHERE run_id=? AND seq>? ORDER BY seq')
+          .all(runId, afterSeq) as RunEventRow[])
+      : (this.db
+          .prepare('SELECT * FROM run_events WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?')
+          .all(runId, afterSeq, limit) as RunEventRow[]);
   }
-  purgeExpiredRunContent(cutoff: string): { runs: number; events: number } {
+  getRunFinishedEvent(runId: string): RunEventRow | undefined {
+    return this.db
+      .prepare(
+        "SELECT * FROM run_events WHERE run_id=? AND type='run.finished' ORDER BY seq DESC LIMIT 1",
+      )
+      .get(runId) as RunEventRow | undefined;
+  }
+  purgeExpiredRunContentBatch(cutoff: string, limit = 100): { runs: number; events: number } {
     const rows = this.db
       .prepare(
-        "SELECT id FROM runs WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out', 'interrupted') AND finished_at IS NOT NULL AND finished_at < ? AND content_purged_at IS NULL",
+        "SELECT id FROM runs WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out', 'interrupted') AND finished_at IS NOT NULL AND finished_at < ? AND content_purged_at IS NULL ORDER BY finished_at, id LIMIT ?",
       )
-      .all(cutoff) as Array<{ id: string }>;
+      .all(cutoff, limit) as Array<{ id: string }>;
     if (!rows.length) return { runs: 0, events: 0 };
     this.db.exec('BEGIN');
     try {
@@ -708,6 +798,7 @@ export type ModelRow = {
   revision: number;
   created_at: string;
   updated_at: string;
+  service_tier?: string | null;
 };
 export type AgentRow = {
   id: string;
@@ -747,6 +838,7 @@ export type RunRow = {
   error_json: string | null;
   created_at: string;
   finished_at: string | null;
+  started_at?: string | null;
   config_snapshot_json: string | null;
   content_purged_at?: string | null;
   events_expired_at?: string | null;
@@ -791,6 +883,7 @@ export class DpapiSecretStore implements SecretStore {
     const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
       input,
       encoding: 'utf8',
+      windowsHide: true,
     });
     if (r.status !== 0) throw new Error(`DPAPI_${mode.toUpperCase()}_FAILED`);
     return r.stdout.trim();
@@ -818,5 +911,118 @@ export class DpapiSecretStore implements SecretStore {
     const all = this.read();
     delete all[name];
     writeFileSync(this.file, JSON.stringify(all), { mode: 0o600 });
+  }
+}
+
+export class AsyncDpapiSecretStore {
+  private readonly file: string;
+  private readonly lock: string;
+  constructor(dataDir: string) {
+    this.file = join(dataDir, 'secrets.json');
+    this.lock = join(dataDir, 'secrets.lock');
+  }
+  private async transform(
+    mode: 'Protect' | 'Unprotect',
+    value: string,
+    encoded = false,
+  ): Promise<string> {
+    if (process.platform !== 'win32') throw new Error('DPAPI_REQUIRES_WINDOWS');
+    const script = `Add-Type -AssemblyName System.Security; $raw=[Console]::In.ReadToEnd(); $bytes=[Convert]::FromBase64String($raw); $out=[Security.Cryptography.ProtectedData]::${mode}($bytes,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($out))`;
+    const input = encoded ? value : Buffer.from(value).toString('base64');
+    return await new Promise<string>((resolvePromise, reject) => {
+      const child = execFile(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', script],
+        {
+          windowsHide: true,
+          timeout: 10000,
+          maxBuffer: 1024 * 1024,
+          encoding: 'utf8',
+        },
+        (error, stdout) => {
+          if (error) reject(new Error(`DPAPI_${mode.toUpperCase()}_FAILED`));
+          else resolvePromise(stdout.trim());
+        },
+      );
+      child.stdin?.on('error', () => child.kill());
+      child.stdin?.end(input);
+    });
+  }
+  private async read(): Promise<Record<string, string>> {
+    try {
+      return JSON.parse(await fsp.readFile(this.file, 'utf8')) as Record<string, string>;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
+      throw error;
+    }
+  }
+  private async update<T>(change: (all: Record<string, string>) => Promise<T>): Promise<T> {
+    await fsp.mkdir(resolve(this.file, '..'), { recursive: true });
+    const token = randomUUID();
+    const deadline = Date.now() + 10000;
+    for (;;) {
+      try {
+        await fsp.writeFile(this.lock, JSON.stringify({ pid: process.pid, token }), {
+          flag: 'wx',
+          mode: 0o600,
+        });
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        if (Date.now() >= deadline) throw new Error('SECRET_STORE_LOCKED');
+        // No read/check/unlink sequence can safely reclaim another writer's lock.
+        // An interrupted writer requires operator recovery after stopping all writers.
+        await delay(25);
+      }
+    }
+    const temporary = `${this.file}.${process.pid}.${token}.tmp`;
+    try {
+      const all = await this.read();
+      const result = await change(all);
+      await fsp.writeFile(temporary, JSON.stringify(all), { flag: 'wx', mode: 0o600 });
+      await fsp.rename(temporary, this.file);
+      return result;
+    } finally {
+      await fsp.rm(temporary, { force: true });
+      const current = await fsp.readFile(this.lock, 'utf8').catch(() => '');
+      let owned = false;
+      try {
+        owned = (JSON.parse(current) as { token?: unknown }).token === token;
+      } catch {
+        // An incomplete or foreign lock is never released by this writer.
+      }
+      if (owned) await fsp.rm(this.lock, { force: true });
+    }
+  }
+  async get(name: string): Promise<string | undefined> {
+    const value = (await this.read())[name];
+    return value === undefined
+      ? undefined
+      : Buffer.from(await this.transform('Unprotect', value, true), 'base64').toString('utf8');
+  }
+  async set(name: string, value: string): Promise<void> {
+    await this.update(async (all) => {
+      all[name] = await this.transform('Protect', value);
+    });
+  }
+  async delete(name: string): Promise<void> {
+    await this.update(async (all) => {
+      delete all[name];
+    });
+  }
+  async getOrCreate(name: string, create: () => string): Promise<string> {
+    return await this.update(async (all) => {
+      if (all[name] !== undefined)
+        return Buffer.from(await this.transform('Unprotect', all[name], true), 'base64').toString(
+          'utf8',
+        );
+      const value = create();
+      all[name] = await this.transform('Protect', value);
+      return value;
+    });
+  }
+  async revision(name: string): Promise<string | undefined> {
+    const value = (await this.read())[name];
+    return value === undefined ? undefined : createHash('sha256').update(value).digest('base64url');
   }
 }

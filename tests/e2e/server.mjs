@@ -22,6 +22,43 @@ const mock = createHttpServer((request, response) => {
     request.on('end', () => {
       const input = JSON.parse(body);
       const last = input.messages?.at(-1)?.content ?? '';
+      if (
+        input.messages?.some(
+          (message) => message.role === 'user' && message.content.includes('target-e2e'),
+        )
+      ) {
+        const usedTool = input.messages.some((message) => message.role === 'tool');
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(
+          JSON.stringify({
+            choices: [
+              {
+                message: usedTool
+                  ? { role: 'assistant', content: 'target-e2e 완료' }
+                  : {
+                      role: 'assistant',
+                      content: null,
+                      tool_calls: [
+                        {
+                          id: 'target-write-1',
+                          type: 'function',
+                          function: {
+                            name: 'write_target',
+                            arguments: JSON.stringify({
+                              targetId: 'output',
+                              content: 'target-e2e-created',
+                            }),
+                          },
+                        },
+                      ],
+                    },
+                finish_reason: usedTool ? 'stop' : 'tool_calls',
+              },
+            ],
+          }),
+        );
+        return;
+      }
       const delay = last.includes('느린 첫 실행')
         ? 500
         : last.includes('빠른 두 번째 실행')
@@ -60,13 +97,9 @@ writeFileSync(resolve(dataDir, 'state.json'), JSON.stringify({ accessToken }), {
 });
 await service.app.listen({ host: '127.0.0.1', port: 47931 });
 
-let closing = false;
-const close = async () => {
-  if (closing) return;
-  closing = true;
-  await service.close();
-  await new Promise((resolvePromise) => mock.close(resolvePromise));
-  process.exit(0);
-};
-process.once('SIGINT', () => void close());
-process.once('SIGTERM', () => void close());
+export default function setup() {
+  return async () => {
+    await service.close();
+    await new Promise((resolvePromise) => mock.close(resolvePromise));
+  };
+}

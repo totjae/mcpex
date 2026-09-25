@@ -1,10 +1,197 @@
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer as createHttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createServer, getLocalAccessToken } from '@mcpex/server';
+import { Storage } from '@mcpex/storage';
+import { waitForRun } from './run-helpers.js';
 
 describe('P6 templates and agent lifecycle', () => {
+  it('updates stored builtin prompts while preserving existing agents and delivering scope to the model', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mcpex-scope-template-'));
+    const requests: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    const mock = createHttpServer((request, response) => {
+      let raw = '';
+      request.on('data', (part) => (raw += part));
+      request.on('end', () => {
+        requests.push(JSON.parse(raw));
+        response.setHeader('content-type', 'application/json');
+        response.end(
+          JSON.stringify({
+            choices: [{ message: { content: 'scope received' }, finish_reason: 'stop' }],
+          }),
+        );
+      });
+    });
+    await new Promise<void>((resolve) => mock.listen(0, '127.0.0.1', resolve));
+    let service = await createServer(dir);
+    try {
+      const headers = { authorization: `Bearer ${getLocalAccessToken(dir)}` };
+      const post = async (url: string, payload: object) => {
+        const response = await service.app.inject({ method: 'POST', url, headers, payload });
+        expect(response.statusCode).toBeLessThan(300);
+        return response.json();
+      };
+      const address = mock.address();
+      if (!address || typeof address === 'string') throw new Error('No mock address');
+      const provider = await post('/api/v1/providers', {
+        name: 'Scope mock',
+        adapter: 'openai-chat',
+        baseUrl: `http://127.0.0.1:${address.port}`,
+      });
+      const model = await post('/api/v1/models', {
+        providerId: provider.id,
+        modelId: 'scope-mock',
+      });
+      const templates = await service.app.inject({
+        method: 'GET',
+        url: '/api/v1/templates',
+        headers,
+      });
+      const builtin = (
+        templates.json().items as Array<{
+          id: string;
+          name: string;
+          config: {
+            userPromptTemplate: string;
+            inputSchema: { properties: { workspace: { description: string } }; required: string[] };
+            runtime: object;
+          };
+        }>
+      ).find((item) => item.name === '코드 구현');
+      expect(builtin).toBeDefined();
+      const legacyPrompt =
+        '구현 작업: {{input.task}}\n작업 폴더: {{input.workspace}}\n요구사항: {{input.requirements}}';
+      const legacy = await post('/api/v1/agents', {
+        displayName: 'Existing coding agent',
+        toolName: 'existing_coding_agent',
+        config: {
+          ...builtin!.config,
+          modelRef: model.id,
+          userPromptTemplate: legacyPrompt,
+          inputSchema: { ...builtin!.config.inputSchema, required: ['task', 'workspace'] },
+          runtime: {
+            ...builtin!.config.runtime,
+            workspacePolicy: { mode: 'fixed', allowedRoots: [dir] },
+          },
+        },
+      });
+      const applied = await post(`/api/v1/agents/${legacy.id}/apply`, {
+        expectedRevision: legacy.draftRevision,
+      });
+      await service.close();
+
+      const storage = new Storage(dir);
+      try {
+        storage.db
+          .prepare('UPDATE templates SET config_json=?, version=1 WHERE id=?')
+          .run(
+            JSON.stringify({ ...builtin!.config, userPromptTemplate: legacyPrompt }),
+            builtin!.id,
+          );
+      } finally {
+        storage.close();
+      }
+      service = await createServer(dir);
+      const refreshed = await service.app.inject({
+        method: 'GET',
+        url: '/api/v1/templates',
+        headers,
+      });
+      const coding = (refreshed.json().items as (typeof builtin)[]).find(
+        (item) => item?.name === '코드 구현',
+      );
+      expect(coding).toMatchObject({ id: builtin!.id, version: 2 });
+      expect(coding!.config.userPromptTemplate).toContain('{{input.scope}}');
+      expect(coding!.config.inputSchema.required).toEqual(['task']);
+      expect(coding!.config.inputSchema.properties.workspace.description).toContain('문맥 정보');
+      const existing = await service.app.inject({
+        method: 'GET',
+        url: `/api/v1/agents/${legacy.id}`,
+        headers,
+      });
+      expect(existing.json()).toMatchObject({
+        appliedVersionId: applied.versionId,
+        draft: { userPromptTemplate: legacyPrompt },
+      });
+      const listed = await service.app.inject({ method: 'GET', url: '/api/v1/agents', headers });
+      expect(
+        listed.json().items.find((item: { id: string }) => item.id === legacy.id),
+      ).toMatchObject({
+        appliedScopeMissing: true,
+      });
+      const preview = await post(`/api/v1/agents/${legacy.id}/template-preview`, {
+        templateId: coding!.id,
+        sections: ['prompts'],
+      });
+      expect(preview.changes).toMatchObject([{ section: 'prompts', changed: true }]);
+      const updatedDraft = await post(`/api/v1/agents/${legacy.id}/template-apply`, {
+        templateId: coding!.id,
+        sections: ['prompts'],
+        expectedRevision: legacy.draftRevision,
+      });
+      expect(updatedDraft).toMatchObject({
+        appliedVersionId: applied.versionId,
+        draft: {
+          userPromptTemplate: coding!.config.userPromptTemplate,
+          inputSchema: { required: ['task', 'workspace'] },
+        },
+      });
+      const stillPublished = await service.app.inject({
+        method: 'GET',
+        url: '/api/v1/agents',
+        headers,
+      });
+      expect(
+        stillPublished.json().items.find((item: { id: string }) => item.id === legacy.id),
+      ).toMatchObject({ appliedScopeMissing: true });
+      await post(`/api/v1/agents/${legacy.id}/apply`, {
+        expectedRevision: updatedDraft.draftRevision,
+      });
+      const republished = await service.app.inject({
+        method: 'GET',
+        url: '/api/v1/agents',
+        headers,
+      });
+      expect(
+        republished.json().items.find((item: { id: string }) => item.id === legacy.id),
+      ).toMatchObject({
+        appliedScopeMissing: false,
+      });
+
+      const fresh = await post('/api/v1/agents', {
+        displayName: 'Fresh coding agent',
+        toolName: 'fresh_coding_agent',
+        config: {
+          ...coding!.config,
+          modelRef: model.id,
+          runtime: {
+            ...coding!.config.runtime,
+            workspacePolicy: { mode: 'fixed', allowedRoots: [dir] },
+          },
+        },
+      });
+      const accepted = await post(`/api/v1/agents/${fresh.id}/test-runs`, {
+        expectedRevision: fresh.draftRevision,
+        input: { task: 'inspect', scope: 'UNIQUE_SCOPE_281', workspace: 'project-a' },
+      });
+      const run = await waitForRun(service.app, headers, accepted.runId);
+      expect(run.status).toBe('completed');
+      const modelMessages = requests[0].messages;
+      expect(modelMessages.find((message) => message.role === 'user')?.content).toContain(
+        'UNIQUE_SCOPE_281',
+      );
+      expect(modelMessages.find((message) => message.role === 'system')?.content).toContain(
+        '작업 대상 위치는 이 기준을 바꾸지 않습니다',
+      );
+    } finally {
+      await service.close();
+      await new Promise<void>((resolve) => mock.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('manages sanitized user templates, selective apply, duplicate, and soft delete', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'mcpex-p6-template-'));
     const service = await createServer(dir);
@@ -223,7 +410,40 @@ describe('P6 templates and agent lifecycle', () => {
         config: { modelRef: model.id },
       },
     });
-    expect(reuseDeletedName.statusCode).toBe(409);
+    expect(reuseDeletedName.statusCode).toBe(201);
+    const reused = JSON.parse(reuseDeletedName.body) as {
+      id: string;
+      enabled: boolean;
+      appliedVersionId: string | null;
+    };
+    expect(reused.id).not.toBe(duplicate.id);
+    expect(reused).toMatchObject({ enabled: false, appliedVersionId: null });
+    const liveNameConflict = await service.app.inject({
+      method: 'POST',
+      url: '/api/v1/agents',
+      headers,
+      payload: {
+        displayName: 'Collision',
+        toolName: 'template_copy',
+        config: { modelRef: model.id },
+      },
+    });
+    expect(liveNameConflict.statusCode).toBe(409);
+    const simultaneous = await Promise.all(
+      [1, 2].map((index) =>
+        service.app.inject({
+          method: 'POST',
+          url: '/api/v1/agents',
+          headers,
+          payload: {
+            displayName: `Concurrent ${index}`,
+            toolName: 'concurrent_copy',
+            config: { modelRef: model.id },
+          },
+        }),
+      ),
+    );
+    expect(simultaneous.map((response) => response.statusCode).sort()).toEqual([201, 409]);
     await service.app.inject({
       method: 'PUT',
       url: `/api/v1/agents/${agent.id}/activation`,

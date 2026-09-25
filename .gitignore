@@ -14,5 +14,10 @@ test-results/
 !.env.example
 secrets.json
 service.lock
+secrets.lock
+secrets.json.*.tmp
+# Local model experiments and generated run evidence
+/artifacts/
+/mcpex-throughput*fixture/
 *.pem
 *.key

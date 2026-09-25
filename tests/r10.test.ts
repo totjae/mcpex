@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   Client,
   InMemoryTransport,
@@ -110,6 +110,43 @@ describe('R10 dynamic STDIO tool catalog', () => {
     expect(refreshRequests).toBeGreaterThanOrEqual(3);
     expect(notifications).toBeGreaterThan(0);
 
+    await client.close();
+    await bridge.server.close();
+  });
+  it('uses the advertised server budget for backend calls beyond the SDK 60-second default', async () => {
+    const options: Array<{ timeout?: number }> = [];
+    const bridge = new ToolCatalogBridge({
+      listTools: async () => ({
+        tools: [
+          {
+            name: 'slow_tool',
+            inputSchema: { type: 'object' },
+            _meta: { 'io.mcpex/bridgeTimeoutMs': 135000, 'example/private': 'not-forwarded' },
+          },
+        ],
+      }),
+      callTool: async (_params, requestOptions) => {
+        options.push(requestOptions ?? {});
+        await new Promise((resolve) => setTimeout(resolve, 61_000));
+        return { content: [{ type: 'text', text: 'done' }] };
+      },
+    });
+    await bridge.refresh();
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'timeout-test', version: '1' });
+    await bridge.server.connect(b);
+    await client.connect(a);
+    expect((await client.listTools()).tools[0]?._meta?.['io.mcpex/bridgeTimeoutMs']).toBe(135000);
+    expect((await client.listTools()).tools[0]?._meta?.['example/private']).toBeUndefined();
+    vi.useFakeTimers();
+    try {
+      const result = client.callTool({ name: 'slow_tool', arguments: {} }, { timeout: 75_000 });
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect((await result).content).toMatchObject([{ text: 'done' }]);
+      expect(options[0]?.timeout).toBe(135000);
+    } finally {
+      vi.useRealTimers();
+    }
     await client.close();
     await bridge.server.close();
   });

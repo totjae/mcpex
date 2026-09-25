@@ -16,14 +16,14 @@ import { DataDirectoryLock, DpapiSecretStore, Storage } from '@mcpex/storage';
 import { DatabaseSync } from 'node:sqlite';
 
 describe('P0 storage and local auth', () => {
-  it('creates schema v4 and preserves it after reopening', () => {
+  it('creates schema v7 and preserves it after reopening', () => {
     const dir = mkdtempSync(join(tmpdir(), 'mcpex-'));
     const first = new Storage(dir);
     first.close();
     const second = new Storage(dir);
     expect(
       second.db.prepare('SELECT value FROM settings WHERE key = ?').get('schemaVersion'),
-    ).toEqual({ value: '4' });
+    ).toEqual({ value: '7' });
     second.close();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -38,7 +38,7 @@ describe('P0 storage and local auth', () => {
     const migrated = new Storage(dir);
     expect(
       migrated.db.prepare("SELECT value FROM settings WHERE key='schemaVersion'").get(),
-    ).toEqual({ value: '4' });
+    ).toEqual({ value: '7' });
     expect(
       migrated.db
         .prepare("SELECT name FROM pragma_table_info('runs') WHERE name='config_snapshot_json'")
@@ -55,7 +55,73 @@ describe('P0 storage and local auth', () => {
         .get(),
     ).toEqual({ name: 'events_expired_at' });
     expect(
-      readdirSync(join(dir, 'backups')).some((name) => name.startsWith('migration-v1-to-v4-')),
+      migrated.db
+        .prepare("SELECT name FROM pragma_table_info('runs') WHERE name='started_at'")
+        .get(),
+    ).toEqual({ name: 'started_at' });
+    expect(
+      readdirSync(join(dir, 'backups')).some((name) => name.startsWith('migration-v1-to-v7-')),
+    ).toBe(true);
+    migrated.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('migrates v5 agents without losing historical run and version references', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mcpex-v5-agents-'));
+    const legacy = new DatabaseSync(join(dir, 'mcpex.db'));
+    legacy.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      INSERT INTO schema_migrations VALUES (5, '2026-01-01T00:00:00.000Z');
+      CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO settings VALUES ('schemaVersion', '5');
+      CREATE TABLE agents (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, tool_name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL, draft_json TEXT NOT NULL, draft_revision INTEGER NOT NULL, applied_version_id TEXT, deleted_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE agent_versions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT, version INTEGER NOT NULL, config_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(agent_id, version));
+      CREATE TABLE runs (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT, agent_version_id TEXT, source TEXT NOT NULL, status TEXT NOT NULL, input_json TEXT NOT NULL, output_json TEXT, error_json TEXT, created_at TEXT NOT NULL, finished_at TEXT);
+      INSERT INTO agents VALUES ('old-agent', 'Old', 'reusable_name', 0, '{}', 1, 'old-version', '2026-01-02', '2026-01-01', '2026-01-02');
+      INSERT INTO agent_versions VALUES ('old-version', 'old-agent', 1, '{}', '2026-01-01');
+      INSERT INTO runs VALUES ('old-run', 'old-agent', 'old-version', 'ui', 'completed', '{}', NULL, NULL, '2026-01-01', '2026-01-01');
+    `);
+    legacy.close();
+    const migrated = new Storage(dir);
+    expect(migrated.db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    expect(migrated.db.prepare('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
+    expect(migrated.db.prepare('SELECT agent_id FROM runs WHERE id=?').get('old-run')).toEqual({
+      agent_id: 'old-agent',
+    });
+    expect(
+      migrated.db.prepare('SELECT agent_id FROM agent_versions WHERE id=?').get('old-version'),
+    ).toEqual({ agent_id: 'old-agent' });
+    const timestamp = new Date().toISOString();
+    migrated.createAgent({
+      id: 'new-agent',
+      display_name: 'New',
+      tool_name: 'reusable_name',
+      enabled: 0,
+      draft_json: '{}',
+      draft_revision: 1,
+      applied_version_id: null,
+      deleted_at: null,
+      created_at: timestamp,
+      updated_at: timestamp,
+    });
+    expect(migrated.listAgents().map((agent) => agent.id)).toEqual(['new-agent']);
+    expect(() =>
+      migrated.createAgent({
+        id: 'collision',
+        display_name: 'Collision',
+        tool_name: 'reusable_name',
+        enabled: 0,
+        draft_json: '{}',
+        draft_revision: 1,
+        applied_version_id: null,
+        deleted_at: null,
+        created_at: timestamp,
+        updated_at: timestamp,
+      }),
+    ).toThrow();
+    expect(
+      readdirSync(join(dir, 'backups')).some((name) => name.startsWith('migration-v5-to-v7-')),
     ).toBe(true);
     migrated.close();
     rmSync(dir, { recursive: true, force: true });

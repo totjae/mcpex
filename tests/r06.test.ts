@@ -97,7 +97,7 @@ describe('R06 cancellation and deadlines', () => {
       headers,
       (JSON.parse(timed.body) as { runId: string }).runId,
     );
-    expect(timedRun).toMatchObject({ status: 'timed_out', error: { code: 'DEADLINE' } });
+    expect(timedRun).toMatchObject({ status: 'timed_out', error: { code: 'PROVIDER_TIMEOUT' } });
     const timedRuns = JSON.parse(
       (
         await service.app.inject({

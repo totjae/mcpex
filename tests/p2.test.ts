@@ -79,7 +79,19 @@ describe('P2 agents and response runs', () => {
       systemPrompt: 'Be concise.',
       userPromptTemplate: 'Task: {{input.task}}',
       generationOverrides: {},
+      runtime: { queueTimeoutMs: 45000, executionTimeoutMs: 180000 },
     };
+    const invalidTime = await service.app.inject({
+      method: 'POST',
+      url: '/api/v1/agents',
+      headers,
+      payload: {
+        displayName: '잘못된 시간 정책',
+        toolName: 'invalid_time_agent',
+        config: { ...config, runtime: { queueTimeoutMs: 45000 } },
+      },
+    });
+    expect(invalidTime.statusCode).toBe(422);
     const agentResponse = await service.app.inject({
       method: 'POST',
       url: '/api/v1/agents',
@@ -117,6 +129,7 @@ describe('P2 agents and response runs', () => {
     expect(detail).toMatchObject({
       status: 'completed',
       output: { value: 'answer:Task: 문서 요약' },
+      configSnapshot: { agent: { runtime: { queueTimeoutMs: 45000, executionTimeoutMs: 180000 } } },
     });
     const runList = await service.app.inject({
       method: 'GET',

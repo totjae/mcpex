@@ -21,5 +21,30 @@ export const BootstrapResponse = z.object({
 export type BootstrapResponse = z.infer<typeof BootstrapResponse>;
 export const ApiError = z.object({ error: z.object({ code: ErrorCode, message: z.string() }) });
 export type ApiError = z.infer<typeof ApiError>;
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 7;
 export const newId = (): string => crypto.randomUUID();
+export const TargetAccess = z.enum(['read', 'write', 'readwrite']);
+export const TargetInput = z
+  .object({
+    id: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/),
+    path: z.string().min(1),
+    access: TargetAccess,
+  })
+  .strict();
+export const TargetsInput = z.array(TargetInput).min(1).max(32);
+export type TargetInput = z.infer<typeof TargetInput>;
+export const targetsJsonSchema = {
+  type: 'array',
+  minItems: 1,
+  maxItems: 32,
+  items: {
+    type: 'object',
+    properties: {
+      id: { type: 'string' },
+      path: { type: 'string' },
+      access: { type: 'string', enum: ['read', 'write', 'readwrite'] },
+    },
+    required: ['id', 'path', 'access'],
+    additionalProperties: false,
+  },
+} as const;

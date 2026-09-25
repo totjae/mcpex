@@ -22,6 +22,26 @@ describe('automatic service startup', () => {
     expect(probes).toBe(3);
   });
 
+  it('reuses the winning daemon when simultaneous startup loses the process race', async () => {
+    let ready = false;
+    let starts = 0;
+    const dependencies = {
+      probe: async () => (ready ? ('ready' as const) : ('absent' as const)),
+      start: vi.fn(async () => {
+        starts += 1;
+        if (starts === 2) throw new Error('MCPex 백그라운드 서비스 시작 실패: exit 1');
+      }),
+      pause: async () => {
+        ready = true;
+      },
+    };
+
+    await expect(
+      Promise.all([ensureService(options, dependencies), ensureService(options, dependencies)]),
+    ).resolves.toEqual([undefined, undefined]);
+    expect(dependencies.start).toHaveBeenCalledTimes(2);
+  });
+
   it('does not start a daemon when the endpoint returns an error', async () => {
     const start = vi.fn();
     await expect(

@@ -1,9 +1,21 @@
-import { isAbsolute, relative, resolve } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { ChatMessage, GenerateResult, ToolCall, ToolDefinition } from '@mcpex/providers';
+
+export const FULL_ACCESS_WORKSPACE = '\0mcpex-full-access';
 
 export class QueueError extends Error {
   constructor(
-    readonly code: 'QUEUE_FULL' | 'CANCELLED' | 'DEADLINE',
+    readonly code:
+      | 'QUEUE_FULL'
+      | 'CANCELLED'
+      | 'DEADLINE'
+      | 'QUEUE_TIMEOUT'
+      | 'EXECUTION_TIMEOUT'
+      | 'PROVIDER_TIMEOUT'
+      | 'MODEL_TURN_LIMIT'
+      | 'TOOL_CALL_LIMIT'
+      | 'CONVERSATION_LIMIT'
+      | 'WORKSPACE_BLOCKED',
     message: string,
     options?: { cause?: unknown },
   ) {
@@ -19,7 +31,9 @@ type Job<T> = {
   signal?: AbortSignal;
   provider?: string;
   resourceGroup?: string;
+  runId?: string;
   deadlineAt?: number;
+  executionTimeoutMs?: number;
   pendingAbort?: () => void;
   pendingTimer?: ReturnType<typeof setTimeout>;
 };
@@ -29,13 +43,29 @@ function overlaps(a: string, b: string): boolean {
   return (
     left === '' ||
     right === '' ||
-    (!isAbsolute(left) && !left.startsWith('..')) ||
-    (!isAbsolute(right) && !right.startsWith('..'))
+    (!isAbsolute(left) && left !== '..' && !left.startsWith(`..${sep}`)) ||
+    (!isAbsolute(right) && right !== '..' && !right.startsWith(`..${sep}`))
   );
 }
 export class WorkspaceLockManager {
   private active: string[] = [];
+  private blocked: string[] = [];
+  isBlocked(workspace: string): boolean {
+    if (workspace === FULL_ACCESS_WORKSPACE) return this.blocked.length > 0;
+    return this.blocked.some(
+      (item) => item === FULL_ACCESS_WORKSPACE || overlaps(item, resolve(workspace)),
+    );
+  }
+  block(workspace: string): void {
+    if (!this.blocked.includes(workspace)) this.blocked.push(workspace);
+  }
+  unblock(workspace: string): void {
+    this.blocked = this.blocked.filter((item) => item !== workspace);
+  }
   canRun(workspace: string): boolean {
+    if (this.isBlocked(workspace)) return false;
+    if (workspace === FULL_ACCESS_WORKSPACE) return this.active.length === 0;
+    if (this.active.includes(FULL_ACCESS_WORKSPACE)) return false;
     const root = resolve(workspace);
     return !this.active.some((item) => overlaps(item, root));
   }
@@ -44,8 +74,10 @@ export class WorkspaceLockManager {
     task: (signal: AbortSignal) => Promise<T>,
     signal?: AbortSignal,
   ): Promise<T> {
-    const root = resolve(workspace);
+    const root = workspace === FULL_ACCESS_WORKSPACE ? workspace : resolve(workspace);
     while (!this.canRun(root)) {
+      if (this.isBlocked(root))
+        throw new QueueError('WORKSPACE_BLOCKED', '명령 종료 확인 실패·추가 실행 차단 상태입니다.');
       if (signal?.aborted) throw new QueueError('CANCELLED', 'workspace 작업이 취소되었습니다.');
       await new Promise<void>((resolvePromise, reject) => {
         const timer = setTimeout(resolvePromise, 10);
@@ -63,6 +95,7 @@ export class WorkspaceLockManager {
     const controller = new AbortController();
     const cancel = () => controller.abort();
     signal?.addEventListener('abort', cancel, { once: true });
+    if (signal?.aborted) cancel();
     try {
       return await task(controller.signal);
     } finally {
@@ -94,6 +127,43 @@ export class RunQueue {
   }
   get canAccept(): boolean {
     return this.pending.length < this.maxPending;
+  }
+  isWorkspaceBlocked(workspace: string): boolean {
+    return this.locks.isBlocked(workspace);
+  }
+  blockWorkspace(workspace: string): void {
+    this.locks.block(workspace);
+    for (const job of [...this.pending]) {
+      if (!job.workspace || !this.locks.isBlocked(job.workspace)) continue;
+      this.pending.splice(this.pending.indexOf(job), 1);
+      this.clearPendingHooks(job);
+      job.reject(
+        new QueueError('WORKSPACE_BLOCKED', '명령 종료 확인 실패·추가 실행 차단 상태입니다.'),
+      );
+    }
+    this.pump();
+  }
+  unblockWorkspace(workspace: string): void {
+    this.locks.unblock(workspace);
+    this.pump();
+  }
+  waitReason(runId: string): 'workspace' | 'provider' | 'resourceGroup' | 'global' | null {
+    const job = this.pending.find((item) => item.runId === runId);
+    if (!job) return null;
+    if (job.workspace && !this.locks.canRun(job.workspace)) return 'workspace';
+    if (
+      job.provider &&
+      (this.providerActive.get(job.provider) ?? 0) >=
+        (this.providerLimits.get(job.provider) ?? this.concurrency)
+    )
+      return 'provider';
+    if (
+      job.resourceGroup &&
+      (this.groupActive.get(job.resourceGroup) ?? 0) >=
+        (this.groupLimits.get(job.resourceGroup) ?? this.concurrency)
+    )
+      return 'resourceGroup';
+    return 'global';
   }
   setProviderLimit(provider: string, limit: number): void {
     this.providerLimits.set(provider, Math.min(Math.max(Math.trunc(limit), 1), 8));
@@ -127,14 +197,29 @@ export class RunQueue {
     task: (signal: AbortSignal) => Promise<T>,
     workspace?: string,
     signal?: AbortSignal,
-    limits?: { provider?: string; resourceGroup?: string; deadlineAt?: number },
+    limits?: {
+      provider?: string;
+      resourceGroup?: string;
+      runId?: string;
+      deadlineAt?: number;
+      executionTimeoutMs?: number;
+    },
   ): Promise<T> {
+    if (workspace && this.locks.isBlocked(workspace))
+      return Promise.reject(
+        new QueueError('WORKSPACE_BLOCKED', '명령 종료 확인 실패·추가 실행 차단 상태입니다.'),
+      );
     if (this.pending.length >= this.maxPending)
       return Promise.reject(new QueueError('QUEUE_FULL', '실행 대기열이 가득 찼습니다.'));
     if (signal?.aborted)
       return Promise.reject(new QueueError('CANCELLED', '실행이 취소되었습니다.'));
     if (limits?.deadlineAt !== undefined && limits.deadlineAt <= Date.now())
-      return Promise.reject(new QueueError('DEADLINE', '실행 deadline이 만료되었습니다.'));
+      return Promise.reject(
+        new QueueError(
+          limits.executionTimeoutMs ? 'QUEUE_TIMEOUT' : 'DEADLINE',
+          '대기 제한 시간이 만료되었습니다.',
+        ),
+      );
     return new Promise<T>((resolvePromise, reject) => {
       const job = {
         task,
@@ -156,7 +241,13 @@ export class RunQueue {
       signal?.addEventListener('abort', job.pendingAbort, { once: true });
       if (limits?.deadlineAt !== undefined)
         job.pendingTimer = setTimeout(
-          () => rejectPending(new QueueError('DEADLINE', '실행 deadline이 만료되었습니다.')),
+          () =>
+            rejectPending(
+              new QueueError(
+                job.executionTimeoutMs ? 'QUEUE_TIMEOUT' : 'DEADLINE',
+                '대기 제한 시간이 만료되었습니다.',
+              ),
+            ),
           Math.max(0, limits.deadlineAt - Date.now()),
         );
       this.pending.push(job);
@@ -203,6 +294,25 @@ export class RunQueue {
         job.reject(new QueueError('CANCELLED', '실행이 취소되었습니다.'));
         continue;
       }
+      if (job.workspace && this.locks.isBlocked(job.workspace)) {
+        this.pending.splice(index, 1);
+        this.clearPendingHooks(job);
+        job.reject(
+          new QueueError('WORKSPACE_BLOCKED', '명령 종료 확인 실패·추가 실행 차단 상태입니다.'),
+        );
+        continue;
+      }
+      if (job.deadlineAt !== undefined && job.deadlineAt <= Date.now()) {
+        this.pending.splice(index, 1);
+        this.clearPendingHooks(job);
+        job.reject(
+          new QueueError(
+            job.executionTimeoutMs ? 'QUEUE_TIMEOUT' : 'DEADLINE',
+            '대기 제한 시간이 만료되었습니다.',
+          ),
+        );
+        continue;
+      }
       if (!this.canStart(job)) {
         index++;
         continue;
@@ -215,26 +325,42 @@ export class RunQueue {
       let deadlineExpired = false;
       const cancel = () => controller.abort(new QueueError('CANCELLED', '실행이 취소되었습니다.'));
       job.signal?.addEventListener('abort', cancel, { once: true });
-      const timer = job.deadlineAt
-        ? setTimeout(
-            () => {
-              deadlineExpired = true;
-              controller.abort(new QueueError('DEADLINE', '실행 deadline이 만료되었습니다.'));
-            },
-            Math.max(0, job.deadlineAt - Date.now()),
-          )
-        : undefined;
+      if (job.signal?.aborted) cancel();
+      const timer =
+        job.deadlineAt || job.executionTimeoutMs
+          ? setTimeout(
+              () => {
+                deadlineExpired = true;
+                controller.abort(
+                  new QueueError(
+                    job.executionTimeoutMs ? 'EXECUTION_TIMEOUT' : 'DEADLINE',
+                    '실행 제한 시간이 만료되었습니다.',
+                  ),
+                );
+              },
+              job.executionTimeoutMs ?? Math.max(0, (job.deadlineAt as number) - Date.now()),
+            )
+          : undefined;
       const execute = job.workspace
         ? this.locks.run(job.workspace, job.task, controller.signal)
         : job.task(controller.signal);
       execute
         .then(job.resolve, (error) =>
           job.reject(
-            deadlineExpired
-              ? new QueueError('DEADLINE', '실행 deadline이 만료되었습니다.', { cause: error })
-              : job.signal?.aborted
-                ? new QueueError('CANCELLED', '실행이 취소되었습니다.', { cause: error })
-                : error,
+            error &&
+              typeof error === 'object' &&
+              'code' in error &&
+              error.code === 'COMMAND_TERMINATION_FAILED'
+              ? error
+              : deadlineExpired
+                ? new QueueError(
+                    job.executionTimeoutMs ? 'EXECUTION_TIMEOUT' : 'DEADLINE',
+                    '실행 제한 시간이 만료되었습니다.',
+                    { cause: error },
+                  )
+                : job.signal?.aborted
+                  ? new QueueError('CANCELLED', '실행이 취소되었습니다.', { cause: error })
+                  : error,
           ),
         )
         .finally(() => {
@@ -249,6 +375,7 @@ export class RunQueue {
 }
 
 export type ToolLoopResult = { text: string; toolCalls: number; messages: ChatMessage[] };
+const MAX_CONVERSATION_BYTES = 8 * 1024 * 1024;
 export async function runToolLoop(options: {
   initialMessages: ChatMessage[];
   tools: ToolDefinition[];
@@ -263,20 +390,40 @@ export async function runToolLoop(options: {
   execute: (call: ToolCall, signal?: AbortSignal) => Promise<string>;
 }): Promise<ToolLoopResult> {
   const messages = [...options.initialMessages];
+  let messageBytes = Buffer.byteLength(JSON.stringify(messages), 'utf8');
+  if (messageBytes > MAX_CONVERSATION_BYTES)
+    throw new QueueError('CONVERSATION_LIMIT', '누적 대화 크기 제한을 초과했습니다.');
+  const append = (message: ChatMessage) => {
+    messageBytes += Buffer.byteLength(JSON.stringify(message), 'utf8');
+    if (messageBytes > MAX_CONVERSATION_BYTES)
+      throw new QueueError('CONVERSATION_LIMIT', '누적 대화 크기 제한을 초과했습니다.');
+    messages.push(message);
+  };
   const maxTurns = options.maxTurns ?? 20;
   const maxCalls = options.maxToolCalls ?? 50;
   let calls = 0;
   for (let turn = 0; turn < maxTurns; turn++) {
     if (options.signal?.aborted) throw new QueueError('CANCELLED', '도구 실행이 취소되었습니다.');
     const result = await options.generate(messages, options.tools, options.signal);
-    messages.push({ role: 'assistant', content: result.text, toolCalls: result.toolCalls });
+    options.signal?.throwIfAborted();
+    append({ role: 'assistant', content: result.text, toolCalls: result.toolCalls });
     if (!result.toolCalls.length) return { text: result.text, toolCalls: calls, messages };
     for (const call of result.toolCalls) {
-      if (++calls > maxCalls) throw new QueueError('DEADLINE', '도구 호출 한도를 초과했습니다.');
+      options.signal?.throwIfAborted();
+      if (++calls > maxCalls)
+        throw new QueueError('TOOL_CALL_LIMIT', '도구 호출 한도를 초과했습니다.');
       let output: string;
       try {
         output = await options.execute(call, options.signal);
       } catch (error) {
+        if (
+          error &&
+          typeof error === 'object' &&
+          'code' in error &&
+          error.code === 'COMMAND_TERMINATION_FAILED'
+        )
+          throw error;
+        options.signal?.throwIfAborted();
         const code =
           error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
             ? error.code
@@ -290,8 +437,8 @@ export async function runToolLoop(options: {
           },
         });
       }
-      messages.push({ role: 'tool', toolCallId: call.id, content: output });
+      append({ role: 'tool', toolCallId: call.id, content: output });
     }
   }
-  throw new QueueError('DEADLINE', '모델 반복 한도를 초과했습니다.');
+  throw new QueueError('MODEL_TURN_LIMIT', '모델 반복 한도를 초과했습니다.');
 }

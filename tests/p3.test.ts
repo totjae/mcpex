@@ -82,8 +82,14 @@ describe('P3 MCP endpoint', () => {
             toolName: 'mcp_agent',
             config: {
               modelRef: model.id,
+              description: 'Workspace MCP agent',
               userPromptTemplate: 'Task: {{input.task}}',
               systemPrompt: '',
+              runtime: {
+                mode: 'tools',
+                tools: ['read_file'],
+                workspacePolicy: { mode: 'fixed', allowedRoots: [dir] },
+              },
             },
           },
         })
@@ -109,6 +115,10 @@ describe('P3 MCP endpoint', () => {
     );
     const tools = await client.listTools();
     const listedAgent = tools.tools.find((tool) => tool.name === 'mcp_agent');
+    expect(listedAgent?.description).toContain('Workspace MCP agent');
+    expect(listedAgent?.description).toContain('상대 경로 또는 범위 내부 절대 경로');
+    expect(listedAgent?.description).toContain('클라우드 모델이면 PC 밖으로 전송됩니다.');
+    expect(listedAgent?.description).not.toContain(dir);
     expect(listedAgent?.inputSchema).toMatchObject({
       type: 'object',
       required: ['task'],
@@ -125,6 +135,7 @@ describe('P3 MCP endpoint', () => {
       outcome: 'succeeded',
       observations: { toolCalls: 0, changes: [], checks: [], truncated: false },
       validation: { format: 'not_required', model: 'not_configured' },
+      verification: { status: 'not_verified', evidence: { checks: [], toolFailures: [] } },
       usage: { promptTokens: 4, completionTokens: 2, totalTokens: 6 },
       error: null,
     });
@@ -159,9 +170,73 @@ describe('P3 MCP endpoint', () => {
       headers,
     });
     expect(JSON.parse(saved.body).enabled).toBe(false);
+    expect(
+      (
+        await restarted.app.inject({
+          method: 'DELETE',
+          url: `/api/v1/agents/${agent.id}`,
+          headers,
+        })
+      ).statusCode,
+    ).toBe(204);
+    const replacementResponse = await restarted.app.inject({
+      method: 'POST',
+      url: '/api/v1/agents',
+      headers,
+      payload: {
+        displayName: 'Replacement MCP Agent',
+        toolName: 'mcp_agent',
+        config: {
+          modelRef: model.id,
+          description: 'Replacement tool',
+          userPromptTemplate: 'New: {{input.task}}',
+        },
+      },
+    });
+    expect(replacementResponse.statusCode).toBe(201);
+    const replacement = JSON.parse(replacementResponse.body) as {
+      id: string;
+      draftRevision: number;
+    };
+    expect(replacement.id).not.toBe(agent.id);
+    const historicalRun = await restarted.app.inject({
+      method: 'GET',
+      url: `/api/v1/runs/${structured.runId}`,
+      headers,
+    });
+    expect(JSON.parse(historicalRun.body).agentId).toBe(agent.id);
+    expect((await restartedClient.listTools()).tools).toHaveLength(0);
+    expect(
+      (
+        await restarted.app.inject({
+          method: 'POST',
+          url: `/api/v1/agents/${replacement.id}/apply`,
+          headers,
+          payload: { expectedRevision: replacement.draftRevision },
+        })
+      ).statusCode,
+    ).toBe(201);
+    expect(
+      (
+        await restarted.app.inject({
+          method: 'PUT',
+          url: `/api/v1/agents/${replacement.id}/activation`,
+          headers,
+          payload: { enabled: true },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect((await restartedClient.listTools()).tools).toMatchObject([
+      { name: 'mcp_agent', description: expect.stringContaining('Replacement tool') },
+    ]);
+    const replacementResult = await restartedClient.callTool({
+      name: 'mcp_agent',
+      arguments: { task: 'hello' },
+    });
+    expect(JSON.stringify(replacementResult)).toContain('mcp:New: hello');
     await restartedClient.close();
     await restarted.close();
     mock.server.close();
     rmSync(dir, { recursive: true, force: true });
-  });
+  }, 15_000);
 });

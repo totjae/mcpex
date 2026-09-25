@@ -10,6 +10,7 @@ export type ServiceOptions = {
 };
 
 type Probe = 'ready' | 'absent';
+const startupExitPrefix = 'MCPex 백그라운드 서비스 시작 실패:';
 
 async function probeService(baseUrl: string): Promise<Probe> {
   let response: Response;
@@ -62,9 +63,7 @@ function startService(options: ServiceOptions): Promise<void> {
     };
     child.once('error', (error) => finish(() => reject(error)));
     child.once('exit', (code) => {
-      finish(() =>
-        reject(new Error(`MCPex 백그라운드 서비스 시작 실패: exit ${code ?? 'unknown'}`)),
-      );
+      finish(() => reject(new Error(`${startupExitPrefix} exit ${code ?? 'unknown'}`)));
     });
     child.once('spawn', () => {
       child.unref();
@@ -98,12 +97,19 @@ export async function ensureService(
     throw new Error(
       '사용자 지정 외부 주소는 자동 시작할 수 없습니다. 해당 서버를 먼저 실행하세요.',
     );
-  await (dependencies.start ?? startService)(options);
   const deadline = Date.now() + (options.startupTimeoutMs ?? 20000);
+  let startupError: Error | undefined;
+  try {
+    await (dependencies.start ?? startService)(options);
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.startsWith(startupExitPrefix)) throw error;
+    startupError = error;
+  }
   do {
     if ((await probe(options.baseUrl)) === 'ready') return;
     await (dependencies.pause ?? delay)(200);
   } while (Date.now() < deadline);
+  if (startupError) throw startupError;
   throw new Error(
     'MCPex 자동 시작 시간이 초과되었습니다. 데이터 폴더 잠금 또는 포트 설정을 확인하세요.',
   );

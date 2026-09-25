@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createServer, getLocalAccessToken, installGracefulShutdown } from '@mcpex/server';
+import { createServer, getLocalAccessTokenAsync, installGracefulShutdown } from '@mcpex/server';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { spawn } from 'node:child_process';
@@ -36,7 +36,7 @@ if (command === 'serve') {
   await ensureService({ baseUrl: serviceBaseUrl, dataDir, port });
   const response = await fetch(`${serviceBaseUrl}/auth/bootstrap`, {
     method: 'POST',
-    headers: { authorization: `Bearer ${getLocalAccessToken(dataDir)}` },
+    headers: { authorization: `Bearer ${await getLocalAccessTokenAsync(dataDir)}` },
   });
   if (!response.ok) throw new Error(`MCPex bootstrap failed: HTTP ${response.status}`);
   const result = (await response.json()) as { token: string };
@@ -79,7 +79,7 @@ if (command === 'serve') {
   const client = new Client({ name: 'mcpex-stdio-bridge', version: '0.1.0' });
   await client.connect(
     new StreamableHTTPClientTransport(mcpUrl, {
-      authProvider: { token: async () => getLocalAccessToken(dataDir) },
+      authProvider: { token: async () => getLocalAccessTokenAsync(dataDir) },
     }),
   );
   const bridge = new ToolCatalogBridge(client);

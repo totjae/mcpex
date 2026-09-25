@@ -9,6 +9,48 @@ import { Storage, type AgentRow, type RunRow } from '@mcpex/storage';
 const auth = (dir: string) => ({ authorization: `Bearer ${getLocalAccessToken(dir)}` });
 
 describe('P6 configuration transfer, retention, and backup', () => {
+  it('purges expired records in bounded batches without touching a running run', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mcpex-rta08-'));
+    try {
+      const storage = new Storage(dir);
+      const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      storage.createAgent({
+        id: 'batch-agent',
+        display_name: 'Batch',
+        tool_name: 'batch_agent',
+        enabled: 0,
+        draft_json: '{}',
+        draft_revision: 1,
+        applied_version_id: null,
+        deleted_at: null,
+        created_at: old,
+        updated_at: old,
+      });
+      for (let index = 0; index < 206; index++)
+        storage.createRun({
+          id: `batch-${index}`,
+          agent_id: 'batch-agent',
+          agent_version_id: null,
+          source: 'test',
+          status: index === 205 ? 'running' : 'completed',
+          input_json: '{"secret":"remove"}',
+          output_json: null,
+          error_json: null,
+          created_at: old,
+          finished_at: old,
+          config_snapshot_json: null,
+        });
+      expect(storage.purgeExpiredRunContentBatch(cutoff)).toMatchObject({ runs: 100 });
+      expect(storage.purgeExpiredRunContentBatch(cutoff)).toMatchObject({ runs: 100 });
+      expect(storage.purgeExpiredRunContentBatch(cutoff)).toMatchObject({ runs: 5 });
+      expect(storage.getRun('batch-205')?.content_purged_at).toBeNull();
+      expect(storage.getRun('batch-204')?.content_purged_at).toEqual(expect.any(String));
+      storage.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('exports sanitized settings and imports remapped inactive drafts atomically', async () => {
     const sourceDir = mkdtempSync(join(tmpdir(), 'mcpex-p6-export-'));
     const source = await createServer(sourceDir);
@@ -129,6 +171,21 @@ describe('P6 configuration transfer, retention, and backup', () => {
     ).toHaveLength(0);
 
     const targetDir = mkdtempSync(join(tmpdir(), 'mcpex-p6-import-'));
+    const targetSeed = new Storage(targetDir);
+    const deletedAt = new Date().toISOString();
+    targetSeed.createAgent({
+      id: 'deleted-portable-agent',
+      display_name: 'Deleted portable agent',
+      tool_name: 'portable_agent',
+      enabled: 0,
+      draft_json: '{}',
+      draft_revision: 1,
+      applied_version_id: null,
+      deleted_at: deletedAt,
+      created_at: deletedAt,
+      updated_at: deletedAt,
+    });
+    targetSeed.close();
     const target = await createServer(targetDir);
     const targetHeaders = auth(targetDir);
     const acceptedPreview = await target.app.inject({
@@ -183,6 +240,7 @@ describe('P6 configuration transfer, retention, and backup', () => {
       ).body,
     ).items as Array<{ enabled: boolean; appliedVersionId: string | null; draft: AgentRow }>;
     expect(agents[0]).toMatchObject({ enabled: false, appliedVersionId: null });
+    expect(agents[0].id).not.toBe('deleted-portable-agent');
     expect(agents[0].draft).toMatchObject({
       modelRef: null,
       runtime: {

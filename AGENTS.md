@@ -40,6 +40,9 @@
 | 추가 검증 항목        | [docs/VERIFICATION_GAPS.md](docs/VERIFICATION_GAPS.md)     | 구현 후 남은 운영·보안·외부 연동 검증과 보류 판단  |
 | 전체 구현 검토 | [docs/IMPLEMENTATION_REVIEW.md](docs/IMPLEMENTATION_REVIEW.md) | 전체 코드 검토 결과, 연결 누락, 우선순위와 수행 검사 |
 | 실사용 개선 항목 | [docs/USABILITY_ISSUES.md](docs/USABILITY_ISSUES.md) | 사용자 보고, 코드 대조, UI 개선 작업과 인수 기준 |
+| 대상 파일 지정 설계 | [docs/TARGET_FILE_DESIGN.md](docs/TARGET_FILE_DESIGN.md) | 실행별 targets 검증, 대상 ID 기반 도구 연결, 권한·호환성·인수 기준 |
+| 런타임 정적 검수 | [docs/RUNTIME_AUDIT.md](docs/RUNTIME_AUDIT.md) | 메모리·비동기·CPU·리소스 수명 위험, 수정 제안과 미수행 검증 |
+| 런타임 개선 작업 인계 | [docs/RUNTIME_REMEDIATION_PLAN.md](docs/RUNTIME_REMEDIATION_PLAN.md) | RTA-01–09 수정 순서, 구현 범위, 회귀·실환경 검증과 완료 기준 |
 
 프로젝트에 존재하지 않는 문서는 필요할 때 생성한다.
 

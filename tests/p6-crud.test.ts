@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createServer, getLocalAccessToken } from '@mcpex/server';
+import { Storage } from '@mcpex/storage';
 
 describe('P6 provider and model management', () => {
   it('supports detail, revision updates, credential removal, and reference-safe deletion', async () => {
@@ -20,6 +21,8 @@ describe('P6 provider and model management', () => {
             name: 'Editable provider',
             adapter: 'openai-chat',
             baseUrl: 'http://127.0.0.1:12345',
+            headers: { 'x-test': 'retained' },
+            extraBody: { custom: 'retained' },
           },
         })
       ).body,
@@ -62,19 +65,54 @@ describe('P6 provider and model management', () => {
       resourceGroup: 'local-test',
       revision: 2,
     });
+    const stored = new Storage(dir);
+    try {
+      const config = JSON.parse(stored.getProvider(provider.id)!.config_json) as {
+        headers: Record<string, string>;
+        extraBody: Record<string, string>;
+      };
+      expect(config.headers).toEqual({ 'x-test': 'retained' });
+      expect(config.extraBody).toEqual({ custom: 'retained' });
+    } finally {
+      stored.close();
+    }
+    const staleCredential = await service.app.inject({
+      method: 'PUT',
+      url: `/api/v1/providers/${provider.id}/credential`,
+      headers,
+      payload: { apiKey: 'not-saved', expectedRevision: 1 },
+    });
+    expect(staleCredential.statusCode).toBe(409);
     const credential = await service.app.inject({
       method: 'PUT',
       url: `/api/v1/providers/${provider.id}/credential`,
       headers,
-      payload: { apiKey: 'test-only-secret' },
+      payload: { apiKey: 'test-only-secret', expectedRevision: 2 },
     });
     expect(JSON.parse(credential.body)).toMatchObject({ hasCredential: true, revision: 3 });
     const credentialDelete = await service.app.inject({
       method: 'DELETE',
       url: `/api/v1/providers/${provider.id}/credential`,
       headers,
+      payload: { expectedRevision: 3 },
     });
     expect(JSON.parse(credentialDelete.body)).toEqual({ hasCredential: false, revision: 4 });
+    const advancedUpdate = await service.app.inject({
+      method: 'PATCH',
+      url: `/api/v1/providers/${provider.id}`,
+      headers,
+      payload: { expectedRevision: 4, extraBody: { projectId: 'added' } },
+    });
+    expect(advancedUpdate.statusCode).toBe(200);
+    const advancedStored = new Storage(dir);
+    try {
+      const config = JSON.parse(advancedStored.getProvider(provider.id)!.config_json) as {
+        extraBody: Record<string, string>;
+      };
+      expect(config.extraBody).toEqual({ custom: 'retained', projectId: 'added' });
+    } finally {
+      advancedStored.close();
+    }
 
     const disposableModel = JSON.parse(
       (

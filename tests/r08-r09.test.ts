@@ -25,9 +25,26 @@ describe('R08 command configuration', () => {
       request.on('data', (chunk) => (raw += chunk));
       request.on('end', () => {
         calls++;
-        const body = JSON.parse(raw) as { messages: Array<{ role: string; content: string }> };
+        const body = JSON.parse(raw) as {
+          messages: Array<{ role: string; content: string }>;
+          tools?: Array<{
+            function?: {
+              name?: string;
+              description?: string;
+              parameters?: { properties?: { commandId?: { enum?: string[] } } };
+            };
+          }>;
+        };
         response.setHeader('content-type', 'application/json');
         if (calls === 1) {
+          const commandTool = body.tools?.find(
+            (tool) => tool.function?.name === 'run_command',
+          )?.function;
+          expect(commandTool?.description).toContain('private_test_runner_942 (Run test suite)');
+          expect(commandTool?.parameters?.properties?.commandId?.enum).toEqual([
+            'private_test_runner_942',
+          ]);
+          expect(JSON.stringify(commandTool)).not.toContain(process.execPath);
           response.end(
             JSON.stringify({
               choices: [
@@ -41,7 +58,7 @@ describe('R08 command configuration', () => {
                         function: {
                           name: 'run_command',
                           arguments: JSON.stringify({
-                            commandId: 'node-check',
+                            commandId: 'private_test_runner_942',
                             args: ['-e', 'process.stdout.write("server-command-ok")'],
                             cwd: '.',
                           }),
@@ -108,7 +125,13 @@ describe('R08 command configuration', () => {
                 maxModelTurns: 3,
                 maxToolCalls: 2,
                 workspacePolicy: { mode: 'fixed', allowedRoots: [workspace] },
-                commands: [{ commandId: 'node-check', executable: process.execPath }],
+                commands: [
+                  {
+                    commandId: 'private_test_runner_942',
+                    executable: process.execPath,
+                    label: 'Run test suite',
+                  },
+                ],
               },
             },
           },
@@ -135,6 +158,13 @@ describe('R08 command configuration', () => {
       (JSON.parse(run.body) as { runId: string }).runId,
     );
     expect(completed.output).toMatchObject({ value: 'command-complete' });
+    expect(completed.verification).toMatchObject({
+      status: 'not_verified',
+      evidence: {
+        checks: [{ commandId: 'private_test_runner_942', exitCode: 0 }],
+        toolFailures: [],
+      },
+    });
 
     const invalidAgent = JSON.parse(
       (

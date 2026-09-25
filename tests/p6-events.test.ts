@@ -1,9 +1,11 @@
 import { createServer as createHttpServer } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createServer, getLocalAccessToken } from '@mcpex/server';
+import { Storage } from '@mcpex/storage';
 
 describe('P6 persisted run events and SSE', () => {
   it('streams ordered lifecycle events and resumes after a sequence cursor', async () => {
@@ -106,8 +108,67 @@ describe('P6 persisted run events and SSE', () => {
     });
     expect(badCursor.statusCode).toBe(400);
 
-    await service.close();
-    await new Promise<void>((resolve) => providerServer.close(() => resolve()));
-    rmSync(dir, { recursive: true, force: true });
+    try {
+      const writer = new Storage(dir);
+      try {
+        for (let index = 0; index < 150; index++)
+          writer.appendRunEvent(
+            runId,
+            'model.finished',
+            JSON.stringify({
+              requestedServiceTier: 'auto',
+              actualServiceTier: 'auto',
+              serviceTierSource: 'test',
+            }),
+          );
+      } finally {
+        writer.close();
+      }
+      const batched = await fetch(baseUrl, { headers: { ...headers, 'last-event-id': '5' } });
+      const batchedBody = await batched.text();
+      expect(batchedBody.match(/^id: \d+$/gm)).toHaveLength(150);
+      expect(batchedBody).toContain('id: 155\n');
+      const details = await service.app.inject({
+        method: 'GET',
+        url: `/api/v1/runs/${runId}`,
+        headers,
+      });
+      expect((JSON.parse(details.body) as { serviceTiers: unknown[] }).serviceTiers).toHaveLength(
+        151,
+      );
+
+      const faultWriter = new Storage(dir);
+      try {
+        const faultRunId = randomUUID();
+        faultWriter.createRun({
+          id: faultRunId,
+          agent_id: agent.id,
+          agent_version_id: null,
+          source: 'test',
+          status: 'running',
+          input_json: '{}',
+          output_json: null,
+          error_json: null,
+          created_at: new Date().toISOString(),
+          finished_at: null,
+          config_snapshot_json: null,
+        });
+        const faultStream = await fetch(
+          `http://127.0.0.1:${serviceAddress.port}/api/v1/runs/${faultRunId}/events`,
+          { headers },
+        );
+        expect(faultStream.status).toBe(200);
+        faultWriter.appendRunEvent(faultRunId, 'model.finished', '{broken-json');
+        await expect(faultStream.text()).rejects.toBeDefined();
+        const alive = await service.app.inject({ method: 'GET', url: '/health' });
+        expect(alive.statusCode).toBe(200);
+      } finally {
+        faultWriter.close();
+      }
+    } finally {
+      await service.close();
+      await new Promise<void>((resolve) => providerServer.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

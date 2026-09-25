@@ -28,6 +28,7 @@ function toolFingerprint(tool: Tool): string {
     inputSchema: tool.inputSchema,
     outputSchema: tool.outputSchema,
     annotations: tool.annotations,
+    bridgeTimeoutMs: tool._meta?.['io.mcpex/bridgeTimeoutMs'],
   });
 }
 
@@ -43,6 +44,14 @@ export class ToolCatalogBridge {
   constructor(private readonly backend: BackendClient) {}
 
   private register(tool: Tool): RegisteredTool {
+    const advertisedTimeout = tool._meta?.['io.mcpex/bridgeTimeoutMs'];
+    const bridgeTimeout =
+      typeof advertisedTimeout === 'number' &&
+      Number.isSafeInteger(advertisedTimeout) &&
+      advertisedTimeout >= 1000 &&
+      advertisedTimeout <= 7_215_000
+        ? advertisedTimeout
+        : undefined;
     return this.server.registerTool(
       tool.name,
       {
@@ -56,6 +65,7 @@ export class ToolCatalogBridge {
             }
           : {}),
         annotations: tool.annotations,
+        ...(bridgeTimeout ? { _meta: { 'io.mcpex/bridgeTimeoutMs': bridgeTimeout } } : {}),
       },
       async (input, context) => {
         const workspace = context.mcpReq._meta?.['io.mcpex/workspace'];
@@ -66,6 +76,7 @@ export class ToolCatalogBridge {
         };
         return this.backend.callTool(params, {
           signal: context.mcpReq.signal,
+          ...(bridgeTimeout ? { timeout: bridgeTimeout } : {}),
         }) as Promise<CallToolResult>;
       },
     );
