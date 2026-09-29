@@ -1,5 +1,19 @@
 # 테스트 및 검증
 
+## 2026-09-29 LLM Gateway 티어 독립 확인
+
+- 현재 소스와 인계 문서를 대조했다. 공식 URL의 기존 openai-chat 등록 인식, 프리셋, 모델/에이전트 상속·재정의, probe/SDK MCP 전송, 응답 시험 티어 문구 유지가 반영됐다.
+- `npm run build` 통과. `npx vitest run tests/llmgateway-service-tier.test.ts tests/service-tier.test.ts --maxWorkers=1` 2개 파일·3개 통과. `npm run test:e2e` Edge 1개 통과(15.3초).
+- 이번 확인에서 전체 회귀/typecheck/lint는 재실행하지 않았다. 실제 사용자 서비스·DB와 외부 API도 사용하지 않았다. 제품 코드 수정은 없으며 최신 빌드와 검증 기록만 갱신했다.
+- 실제 처리 티어는 최상위 service_tier만 지원한다. Gateway 메타데이터 단독 응답의 정확한 경로 확인·연결 및 실제 계정/모델/청구 검증은 남는다. 따라서 티어 선택·전송의 모의 검증 완료와 전체 실연동 완료를 구분한다.
+
+## 2026-09-26 LLM Gateway 서비스 티어 — OpenAI 호환 형식
+
+- `npm run build`, `npm run typecheck`, `npm run lint`, 변경 코드 Prettier 확인 통과. 전체 `npx vitest run --maxWorkers=1`: 34개 파일·110개 통과, 기존 opt-in 실제 OS 3세대 시험 1개 제외. `npm run test:e2e`: Edge 1개 통과(14.7초).
+- `tests/llmgateway-service-tier.test.ts` 2개와 기존 `tests/service-tier.test.ts` 1개 통과. 임시 서비스·모의 Gateway 응답으로 프리셋, 기존 openai profileId의 공식 Gateway URL, generic 등록, 정확한 URL 경계, 모델 probe 요청/실제 분리, 에이전트 상속·재정의·필드 생략, 적용 후 SDK MCP 호출, 400/403 오류의 무단 재시도 없음, 메타데이터만 있는 응답의 실제값 확인 불가를 확인했다.
+- Edge E2E 1개 통과: Gateway 프리셋 선택, 모델 `flex` 선택·저장, 에이전트 티어 선택·저장, 응답 시험의 `요청: flex, 실제: 확인 불가` 문구를 모의 응답으로 확인했다.
+- 실제 LLM Gateway API·계정·모델·플랜·청구는 호출/검증하지 않았다. 실제 `used_service_tier` 메타데이터의 정확한 경로가 확인되면 별도 응답 fixture와 함께 확장해야 한다.
+
 ## 2026-09-25 GitHub 게시 전 작동 확인
 
 - `npm run build`, `npm run typecheck`, `npm run lint` 통과.

@@ -703,11 +703,26 @@ function serviceTierSetting(
   throw new ProviderError(status, '지원하지 않는 서비스 티어 설정입니다.');
 }
 function supportsServiceTier(provider: { adapter: string; config: ProviderInput }): boolean {
-  return (
-    provider.adapter === 'openai-chat' &&
-    provider.config.profileId === 'openai' &&
-    provider.config.baseUrl.replace(/\/+$/, '') === 'https://api.openai.com/v1'
-  );
+  if (provider.adapter !== 'openai-chat') return false;
+  try {
+    const url = new URL(provider.config.baseUrl);
+    if (
+      url.protocol !== 'https:' ||
+      url.port ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      url.pathname.replace(/\/+$/, '') !== '/v1'
+    )
+      return false;
+    return (
+      url.hostname === 'api.llmgateway.io' ||
+      (url.hostname === 'api.openai.com' && provider.config.profileId === 'openai')
+    );
+  } catch {
+    return false;
+  }
 }
 function requireServiceTierSupport(
   choice: string | undefined,

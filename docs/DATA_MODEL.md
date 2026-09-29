@@ -53,7 +53,7 @@ ProviderConfig:
 ModelConfig:
 
 - modelId, label, defaultGeneration(temperature/topP/maxOutputTokens 및 adapterOptions).
-- service_tier: 별도 nullable DB 필드. null은 기존 모델의 전용 설정 없음(고급 값 유지), 새 모델의 기본 `provider-default`는 직접 OpenAI 요청에서 필드 생략을 뜻한다. `auto` 문자열과 필드 생략은 다르다.
+- service_tier: 별도 nullable DB 필드. null은 기존 모델의 전용 설정 없음(고급 값 유지), 새 모델의 기본 `provider-default`는 지원된 OpenAI 직접/공식 LLM Gateway 요청에서 필드 생략을 뜻한다. `auto` 문자열과 필드 생략은 다르다.
 - capabilities: text/toolCalling/jsonOutput/imageInput 각각 supported/unsupported/unknown 및 출처(user/probe), checkedAt.
 - v1 실행 입력은 텍스트만 지원한다. imageInput은 후속 호환 정보이며 이미지 실행 UI는 제공하지 않는다.
 - 기능 시험 fingerprint는 adapter/baseUrl/modelId/기능 관련 옵션으로 계산한다. 변경 시 이전 시험은 stale이며 통과 조건으로 사용하지 않는다.

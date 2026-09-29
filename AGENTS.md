@@ -43,6 +43,7 @@
 | 대상 파일 지정 설계 | [docs/TARGET_FILE_DESIGN.md](docs/TARGET_FILE_DESIGN.md) | 실행별 targets 검증, 대상 ID 기반 도구 연결, 권한·호환성·인수 기준 |
 | 런타임 정적 검수 | [docs/RUNTIME_AUDIT.md](docs/RUNTIME_AUDIT.md) | 메모리·비동기·CPU·리소스 수명 위험, 수정 제안과 미수행 검증 |
 | 런타임 개선 작업 인계 | [docs/RUNTIME_REMEDIATION_PLAN.md](docs/RUNTIME_REMEDIATION_PLAN.md) | RTA-01–09 수정 순서, 구현 범위, 회귀·실환경 검증과 완료 기준 |
+| LLM Gateway 티어 확장 인계 | [docs/LLMGATEWAY_SERVICE_TIER_PLAN.md](docs/LLMGATEWAY_SERVICE_TIER_PLAN.md) | 기존 등록 호환, 티어 상속·전송·응답 계약과 검증 기준 |
 
 프로젝트에 존재하지 않는 문서는 필요할 때 생성한다.
 

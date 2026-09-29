@@ -583,6 +583,49 @@ test('registers a model, manages two agents, shows actionable errors, and record
   await page.getByRole('button', { name: '에이전트', exact: true }).click();
   await page.getByRole('button', { name: /Tier UI agent/ }).click();
   await expect(page.getByLabel('에이전트 서비스 티어')).toHaveValue('auto');
+
+  await page.getByRole('button', { name: '프로바이더', exact: true }).click();
+  await page.getByLabel('이름').fill('Gateway UI');
+  await page.getByRole('combobox', { name: '프로필' }).selectOption('llmgateway');
+  await page.getByRole('button', { name: '프로바이더 등록' }).click();
+  await page.getByRole('button', { name: '모델', exact: true }).click();
+  await page.getByLabel('프로바이더').selectOption({ label: 'Gateway UI' });
+  await page.getByLabel('모델 ID').fill('gateway-ui-model');
+  await tierCreateForm.getByLabel('기본 서비스 티어').selectOption('flex');
+  await page.getByRole('button', { name: '등록', exact: true }).click();
+  await expect(
+    page
+      .locator('.model-list li')
+      .filter({ hasText: 'gateway-ui-model' })
+      .getByLabel('기본 서비스 티어'),
+  ).toHaveValue('flex');
+  await probeForm
+    .getByRole('combobox', { name: '모델', exact: true })
+    .selectOption({ label: 'gateway-ui-model (Gateway UI)' });
+  await page.route('**/api/v1/models/*/probes', (route) =>
+    route.fulfill({
+      json: {
+        result: { text: 'Gateway fixture' },
+        requestedServiceTier: 'flex',
+        actualServiceTier: null,
+      },
+    }),
+  );
+  await probeForm.getByRole('button', { name: '시험', exact: true }).click();
+  await expect(probeForm.locator('pre')).toContainText('서비스 티어 — 요청: flex, 실제: 확인 불가');
+  await page.unroute('**/api/v1/models/*/probes');
+  await page.getByRole('button', { name: '에이전트', exact: true }).click();
+  await page.getByLabel('에이전트 이름').fill('Gateway UI agent');
+  await page.getByLabel('MCP 도구 이름').fill('gateway_ui_agent');
+  await page
+    .locator('.create-row')
+    .getByLabel('모델')
+    .selectOption({ label: 'gateway-ui-model (Gateway UI)' });
+  await page.getByRole('button', { name: '생성', exact: true }).click();
+  await page.getByLabel('에이전트 서비스 티어').selectOption('priority');
+  await page.getByRole('button', { name: '초안 저장' }).click();
+  await expect(page.getByRole('status')).toContainText('초안을 저장했습니다.');
+
   await page.route('**/api/v1/safety-blocks', (route) =>
     route.fulfill({
       status: 200,

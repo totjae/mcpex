@@ -4,9 +4,11 @@
 
 모델 생성/PATCH는 별도 `serviceTier`(`provider-default`/`auto`/`default`/`flex`/`priority`)를 받고 모델 DTO에서 반환한다. 새 모델 기본값 `provider-default`는 요청 필드 생략이다. 에이전트 초안의 `serviceTier`는 `inherit`(기본), `provider-default` 또는 명시 티어이며 숫자 전용 `generationOverrides`와 별개다. 우선순위는 에이전트 명시 선택 → 모델 기본 선택 → 기존 프로바이더 고급 값/필드 생략이다. `auto`는 필드 생략과 다르다.
 
-전용 티어 선택은 `profileId=openai`, `adapter=openai-chat`, `baseUrl=https://api.openai.com/v1` 조합에만 허용한다. 그 밖의 연결은 지원 미확인으로 표시하고 명시 티어 저장을 400 또는 실행 준비 시 422로 거부한다. 실제 모델·계정 자격은 사전 확인하지 않으며 공급자가 거부하면 오류를 그대로 돌려주고 다른 티어로 재시도하지 않는다. 직접 OpenAI 요청에서는 명시 선택이 기존 `extraBody.service_tier`를 덮어쓰고 `provider-default`는 요청에서 이 키를 제거한다. 저장된 extraBody와 다른 헤더는 수정하지 않는다. 미확인 공급자의 기존 고급 값은 호환성을 위해 그대로 전달한다.
+전용 티어 선택은 `openai-chat` 어댑터의 직접 OpenAI 공식 URL(`profileId=openai`) 또는 공식 LLM Gateway URL(`https://api.llmgateway.io/v1`, profileId·표시 이름 무관)에 허용한다. URL은 HTTPS·정확한 호스트·기본 포트·`/v1` 경로(끝 슬래시 허용)이며 인증정보·쿼리·fragment가 없어야 한다. 다른 연결은 지원 미확인으로 표시하고 명시 티어 저장을 400 또는 실행 준비 시 422로 거부한다. 이는 요청 형식 지원 판정이며 모델·계정·플랜별 티어 자격 보장은 아니다. 공급자가 거부하면 오류를 그대로 돌려주고 다른 티어로 재시도하지 않는다. 지원 연결에서 명시 선택은 기존 `extraBody.service_tier`를 덮어쓰고 `provider-default`는 요청에서 이 키를 제거한다. 저장된 extraBody와 다른 헤더는 수정하지 않는다. 미확인 공급자의 기존 고급 값은 호환성을 위해 그대로 전달한다.
 
 모델 probe 응답은 `requestedServiceTier`, `actualServiceTier`를 분리한다. 에이전트 preview의 `serviceTier`는 `{requested,source}`이며 실제 처리 티어는 없다. 실행의 매 `model.finished` 이벤트는 요청/실제 티어와 출처를 기록하고 GET `/runs`·`/runs/:id`의 `serviceTiers`에서 턴별로 조회할 수 있다. 공급자 응답에 티어가 없으면 `actual=null`(확인 불가), 이벤트가 만료되면 목록 전체가 `null`이다. 적용·실행 스냅샷에 모델/에이전트 선택을 보존하고 MCP 도구 인자에는 추가하지 않는다. 큐·동시 실행·제한시간은 자동 변경하지 않는다. 공식 근거: [OpenAI Chat Completions](https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions/methods/create), [서비스 티어 오류](https://developers.openai.com/api/docs/guides/error-codes).
+
+LLM Gateway의 OpenAI 호환 Chat Completions 응답에서는 최상위 `service_tier`만 실제값으로 읽는다. `metadata.used_service_tier`의 정확한 경로와 우선순위는 확인되지 않아 사용하지 않으며, 최상위 값이 없으면 실제값은 `null`이다. 공식 요청 계약: [LLM Gateway Service Tiers](https://docs.llmgateway.io/features/service-tiers).
 
 ## 대상 변경 결과 조회 (2026-09-24)
 

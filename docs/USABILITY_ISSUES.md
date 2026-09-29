@@ -2,7 +2,9 @@
 
 ## UX16 — 공급자가 지원하는 서비스 티어 선택
 
-**상태: OpenAI 직접 연결 범위 구현·모의 자동 검증 완료. 실제 계정/모델과 다른 공급자는 미검증.** 모델 호출 시 확인된 공급자에서 서비스 티어를 선택할 수 있다.
+**상태: OpenAI 직접/공식 LLM Gateway 연결 범위 구현·모의 자동 검증 완료. 실제 계정/모델/플랜과 다른 공급자는 미검증.** 모델 호출 시 확인된 공급자에서 서비스 티어를 선택할 수 있다.
+
+2026-09-26 후속: 기존 `openai-chat` 요청/응답 형식으로 LLM Gateway 공식 URL을 지원한다. 기존 등록의 profileId·표시 이름은 변경하지 않으며 프리셋 `llmgateway`를 추가했다. 응답 최상위 `service_tier`가 있을 때만 실제 티어로 표시하고 메타데이터만 있으면 확인 불가로 남긴다. 본 절의 2026-09-25 직접 OpenAI 한정 설명은 최초 구현 이력이다.
 
 2026-09-25 구현: OpenAI 공식 [Chat Completions API](https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions/methods/create)의 `service_tier` 요청/응답 계약과 [Fast mode 안내](https://developers.openai.com/api/docs/guides/fast-mode)를 기준으로 `auto`, `default`, `flex`, `priority`를 직접 OpenAI 프로필+공식 엔드포인트에만 노출한다. `fast`는 공식 문서상 `priority`와 관련되지만 모델별 응답 차이가 있으므로 이 첫 UI 목록에는 넣지 않았다. 모델·계정별 사용 가능 여부는 미확인이며 공급자 거부는 [오류 안내](https://developers.openai.com/api/docs/guides/error-codes)에 따라 그대로 반환하고 다른 티어로 자동 변경하지 않는다. 다른 OpenAI 호환 공급자·Anthropic·Gemini 등은 지원 미확인으로 표시하고 전용 선택을 막는다.
 

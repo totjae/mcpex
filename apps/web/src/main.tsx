@@ -1986,9 +1986,9 @@ function App() {
             </select>
           </label>
           <p>
-            OpenAI 직접 연결에서만 선택할 수 있습니다. 모델·계정별 사용 가능 여부는 실제 요청 전
-            미확인입니다. 요금과 처리 속도는 티어에 따라 달라질 수 있습니다. 미확인 공급자의 기존
-            고급 설정은 그대로 유지됩니다.
+            OpenAI 직접 연결 또는 공식 LLM Gateway 연결에서 선택할 수 있습니다. 모델·계정·플랜별
+            사용 가능 여부는 실제 요청 전 미확인입니다. 요금과 처리 속도는 티어에 따라 달라질 수
+            있습니다. 미확인 공급자의 기존 고급 설정은 그대로 유지됩니다.
           </p>
           {createModelProvider?.advancedServiceTier && (
             <p role="note">
@@ -2238,7 +2238,7 @@ function App() {
               </label>
               <p className="wide">
                 {agentProvider?.serviceTierSupport === 'supported'
-                  ? 'OpenAI API 요청 필드입니다. 모델·계정 사용 가능 여부는 미확인입니다.'
+                  ? 'OpenAI 호환 요청 필드입니다. 모델·계정·플랜별 사용 가능 여부는 미확인입니다.'
                   : '이 공급자의 서비스 티어 계약은 미확인입니다. 명시적 선택은 사용할 수 없으며 기존 고급 설정은 유지됩니다.'}{' '}
                 적용 버전은 저장 시점 설정을 사용합니다.
               </p>

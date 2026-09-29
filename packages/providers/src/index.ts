@@ -46,6 +46,14 @@ const providerProfiles: ProviderProfile[] = [
     credential: 'required',
   },
   {
+    id: 'llmgateway',
+    name: 'LLM Gateway',
+    adapter: 'openai-chat',
+    location: 'cloud',
+    baseUrl: 'https://api.llmgateway.io/v1',
+    credential: 'required',
+  },
+  {
     id: 'openrouter',
     name: 'OpenRouter',
     adapter: 'openai-chat',
